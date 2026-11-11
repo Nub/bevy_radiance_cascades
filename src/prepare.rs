@@ -57,6 +57,10 @@ pub struct CascadeUniform {
     temporal_blend: f32,
     has_motion_vectors: u32,
     ambient_occlusion: f32,
+    specular: f32,
+    specular_roughness: Vec2,
+    emissive_scale: f32,
+    emissive_unexposed: u32,
 }
 
 pub const VOXEL_FORMAT: TextureFormat = TextureFormat::R32Uint;
@@ -67,6 +71,7 @@ const MAX_VOXEL_LEVELS: usize = 8;
 pub struct VoxelUniform {
     origin: [IVec4; MAX_VOXEL_LEVELS],
     update_prev_origin: IVec4,
+    prev_clip_from_world: Mat4,
     resolution: u32,
     levels: u32,
     update_level: u32,
@@ -74,6 +79,8 @@ pub struct VoxelUniform {
     voxel_size: f32,
     blend: f32,
     history_scale: f32,
+    options: u32,
+    has_motion_vectors: u32,
 }
 
 /// The world cache's textures and where each of its levels currently sits.
@@ -83,6 +90,9 @@ pub struct VoxelCache {
     /// Which blocks of voxels have anything in them: see `voxel_mask_texel`
     /// in `voxel.wesl`.
     pub mask: TextureView,
+    /// For each texel of the level being updated, a pixel whose surface lies
+    /// in its voxel (see `voxel_update.wesl`). Cleared every frame.
+    pub marks: Buffer,
     pub uniform: Buffer,
     pub resolution: u32,
     /// 0 when there is no world cache (and the textures are placeholders).
@@ -125,9 +135,9 @@ impl Layout {
             cascade_count: settings.cascade_count.clamp(1, MAX_CASCADES),
             voxels: settings.world_cache.map(|cache| {
                 (
-                    // (A power of two, and so a whole number of the blocks of
-                    // 16 voxels the occupancy masks are made of.)
-                    cache.resolution.clamp(16, 256).next_power_of_two(),
+                    // (A whole number of the blocks of 16 voxels the occupancy
+                    // masks are made of.)
+                    cache.resolution.clamp(16, 256).next_multiple_of(16),
                     cache.levels.clamp(1, MAX_VOXEL_LEVELS as u32),
                     cache.voxel_size.max(1e-3).to_bits(),
                 )
@@ -211,8 +221,16 @@ pub struct RadianceCascadesResources {
     pub(crate) raw_irradiance: TextureView,
     /// The accumulated incoming light: this frame's and last frame's.
     irradiance: [TextureView; 2],
-    /// Which of `indirect` and `irradiance` is written this frame.
+    /// The same over only the last few frames (see `accumulate` in
+    /// `gather.wesl`): this frame's and last frame's.
+    recent: [TextureView; 2],
+    /// Which of `indirect`, `irradiance` and `recent` is written this frame.
     current: usize,
+    /// Frames since these were made.
+    frame: u32,
+    /// The cascades that keep last frame's result this frame, a bit each
+    /// (see `RadianceCascades::amortize_far`).
+    pub(crate) kept_cascades: u32,
     clip_from_world: Mat4,
     /// Copy of the depth buffer as the opaque pass left it. (The depth
     /// prepass's own copy lacks everything that is drawn without a prepass.)
@@ -251,6 +269,14 @@ impl RadianceCascadesResources {
 
     pub(crate) fn previous_irradiance(&self) -> &TextureView {
         &self.irradiance[1 - self.current]
+    }
+
+    pub(crate) fn recent(&self) -> &TextureView {
+        &self.recent[self.current]
+    }
+
+    pub(crate) fn previous_recent(&self) -> &TextureView {
+        &self.recent[1 - self.current]
     }
 }
 
@@ -308,6 +334,8 @@ pub fn prepare_radiance_cascades_resources(
                 resources.clip_from_world = clip_from_world;
                 resources.current = 1 - resources.current;
                 resources.replace_scene = replace_scene;
+                resources.frame = resources.frame.wrapping_add(1);
+                resources.kept_cascades = kept_cascades(settings, resources.frame);
                 if !settings.debug.is_lighting() && resources.debug_view.is_none() {
                     resources.debug_view = Some(create_view_texture(
                         &render_device,
@@ -323,6 +351,8 @@ pub fn prepare_radiance_cascades_resources(
                     settings,
                     view,
                     camera.exposure,
+                    prev_clip_from_world,
+                    motion_vectors,
                 );
                 write_uniforms(
                     &render_queue,
@@ -343,6 +373,8 @@ pub fn prepare_radiance_cascades_resources(
                     settings,
                     view,
                     camera.exposure,
+                    clip_from_world,
+                    motion_vectors,
                 );
                 write_uniforms(
                     &render_queue,
@@ -434,6 +466,10 @@ fn create_resources(
     let irradiance = [
         create_texture("radiance_cascades_irradiance_a", layout.view_size),
         create_texture("radiance_cascades_irradiance_b", layout.view_size),
+    ];
+    let recent = [
+        create_texture("radiance_cascades_recent_a", layout.view_size),
+        create_texture("radiance_cascades_recent_b", layout.view_size),
     ];
 
     let depth = render_device.create_texture(&TextureDescriptor {
@@ -557,6 +593,12 @@ fn create_resources(
         radiance: create_voxel_texture("radiance_cascades_voxel_radiance"),
         meta: create_voxel_texture("radiance_cascades_voxel_meta"),
         mask,
+        marks: render_device.create_buffer(&BufferDescriptor {
+            label: Some("radiance_cascades_voxel_marks"),
+            size: (resolution as u64).pow(3) * 4,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }),
         uniform: render_device.create_buffer(&BufferDescriptor {
             label: Some("radiance_cascades_voxel_uniform"),
             size: VoxelUniform::min_size().get(),
@@ -580,6 +622,7 @@ fn create_resources(
         indirect,
         raw_irradiance,
         irradiance,
+        recent,
         depth,
         depth_view,
         pyramid,
@@ -588,6 +631,8 @@ fn create_resources(
         color_levels,
         color_size,
         current: 0,
+        frame: 0,
+        kept_cascades: 0,
         clip_from_world,
         view_size: layout.view_size,
         debug_view: None,
@@ -601,14 +646,45 @@ fn create_resources(
 
 /// Moves on to the next level of the world cache (one is updated per frame),
 /// recentring it on the camera.
+/// Which cascades are not traced on a frame (see
+/// `RadianceCascades::amortize_far`): none for the first frames, while there
+/// is nothing yet to keep.
+fn kept_cascades(settings: &RadianceCascades, frame: u32) -> u32 {
+    if !settings.amortize_far || frame < 8 {
+        return 0;
+    }
+    (0..MAX_CASCADES).fold(0, |kept, cascade| {
+        let traced = match cascade {
+            0..=2 => true,
+            3 | 4 => frame % 2 == cascade % 2,
+            _ => frame % 4 == cascade % 4,
+        };
+        kept | (!traced as u32) << cascade
+    })
+}
+
 fn write_voxel_uniform(
     render_queue: &RenderQueue,
     voxels: &mut VoxelCache,
     settings: &RadianceCascades,
     view: &ExtractedView,
     exposure: f32,
+    prev_clip_from_world: Mat4,
+    motion_vectors: bool,
 ) {
     let cache = settings.world_cache.unwrap_or_default();
+    // Must match the `VOXEL_*` flags in `voxel.wesl`.
+    let options = [
+        cache.skip_moving,
+        cache.soft_occupancy,
+        cache.blend_lookup,
+        cache.coarse_from_fine,
+        cache.clamp_outliers,
+        cache.soft_facing,
+    ]
+    .iter()
+    .enumerate()
+    .fold(0u32, |flags, (bit, on)| flags | (*on as u32) << bit);
     // The fine levels are what is near, where the view changes fastest: the
     // first is updated every other frame, the next every fourth, and so on.
     voxels.frame = voxels.frame.wrapping_add(1);
@@ -627,6 +703,7 @@ fn write_voxel_uniform(
     let uniform = VoxelUniform {
         origin: voxels.origin.map(|origin| origin.extend(0)),
         update_prev_origin: prev_origin.extend(0),
+        prev_clip_from_world,
         resolution: voxels.resolution,
         levels: voxels.levels,
         update_level,
@@ -642,6 +719,8 @@ fn write_voxel_uniform(
         } else {
             1.0
         },
+        options,
+        has_motion_vectors: motion_vectors as u32,
     };
     voxels.exposure = exposure;
     let mut buffer = encase::UniformBuffer::new(Vec::new());
@@ -703,6 +782,13 @@ fn write_uniforms(
             } else {
                 0.0
             },
+            specular: settings.specular.clamp(0.0, 1.0),
+            specular_roughness: Vec2::new(
+                settings.specular_roughness.start,
+                settings.specular_roughness.end,
+            ),
+            emissive_scale: settings.emissive_scale.max(0.0),
+            emissive_unexposed: settings.emissive_unexposed as u32,
         };
 
         let mut buffer = encase::UniformBuffer::new(Vec::new());

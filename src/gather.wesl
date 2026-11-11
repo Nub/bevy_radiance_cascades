@@ -4,10 +4,10 @@
 
 import package::common::{
     params, view, voxels, depth_tex, gbuffer_tex, cascade_in, output, trace_voxels,
-    history, ambient_occlusion,
+    history, ambient_occlusion, recent_history, recent_out,
     irradiance_history, irradiance_out, motion_vectors, ndc_to_pixel, view_size_f,
     oct_dir, view_size_u, linear_depth, pixel_footprint, world_position,
-    gbuffer_valid, gbuffer_normal, surface_normal, gbuffer_diffuse_color, probe_weights, probe_index, MAX_RADIANCE,
+    gbuffer_valid, gbuffer_normal, surface_normal, gbuffer_reflectance, probe_weights, probe_index, MAX_RADIANCE,
     DEBUG_IRRADIANCE, DEBUG_SURFACES, DEBUG_WORLD_CACHE,
 };
 
@@ -58,29 +58,62 @@ fn incoming(pix: vec2<i32>, g: vec4<u32>, depth: f32) -> vec3<f32> {
     return clamp(light, vec3<f32>(0.0), vec3<f32>(MAX_RADIANCE));
 }
 
+fn luminance(color: vec3<f32>) -> f32 {
+    return dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+/// What `accumulate` makes of a pixel: the light, how many frames of it have
+/// accumulated, and the light over only the last few of them.
+struct Accumulated {
+    light: vec3<f32>,
+    frames: f32,
+    recent: vec3<f32>,
+}
+
+/// The share of a frame in the light of the last few frames.
+const RECENT_BLEND: f32 = 0.25;
+/// How far from the light of the last few frames, in standard deviations of
+/// this frame's light around the pixel and as a share of it, the accumulated
+/// light may be before it is taken for stale.
+const HISTORY_DEVIATIONS: f32 = 2.0;
+const HISTORY_SLACK: f32 = 0.5;
+/// How many times brighter than it has been, and by how much besides, a
+/// frame may make a place that has been in view a while. A probe now and then
+/// catches a small bright light square on for a frame; unchecked, a patch of
+/// wall lights up with it and takes a second to fade. (A light that does come
+/// on still gets there in a few frames, each as many times the last.)
+const FIREFLY_GAIN: f32 = 3.0;
+const FIREFLY_FLOOR: f32 = 0.02;
+const FIREFLY_FRAMES: f32 = 4.0;
+
 /// Blends this frame's incoming light into what has accumulated at the same
 /// place in the world. A view that is jittered for temporal anti-aliasing draws
 /// small lights differently every frame, and what they light flickers with
 /// them; accumulated, it is as steady as the anti-aliased image.
 ///
-/// What has accumulated is first brought within `low..high`, the range of this
-/// frame's light around the pixel: light that has moved on leaves no trail
-/// behind it, as the old light there is now outside what its surroundings show.
+/// Two lengths of memory are kept: the light as it accumulates at the pace of
+/// `temporal_blend`, which is what is shown, and the light of only the last few
+/// frames. The long one is held within reach of the short one, so that light
+/// which has moved on leaves no trail behind it. (Held within reach of this
+/// frame alone, as it once was, it was thrown away whenever a frame differed
+/// from the rest: a small bright light that the rays of one jitter in eight
+/// miss made what it lit drop every eighth frame and creep back.)
 ///
-/// Returns the light and, in a, how many frames of it have accumulated (which
-/// is kept in the alpha of the indirect light, `history` being last frame's).
-/// A place that has only just come into view takes the mean of what it has
-/// seen so far, and only settles into `temporal_blend` once it has seen as
-/// many frames as that stands for: it is neither left with a frame's worth of
-/// flicker nor slow to lose it.
-fn accumulate(light: vec3<f32>, low: vec3<f32>, high: vec3<f32>, pix: vec2<i32>, depth: f32) -> vec4<f32> {
+/// `frames` is kept in the alpha of the indirect light, `history` being last
+/// frame's. A place that has only just come into view takes the mean of what
+/// it has seen so far, and only settles into `temporal_blend` once it has seen
+/// as many frames as that stands for: it is neither left with a frame's worth
+/// of flicker nor slow to lose it.
+fn accumulate(traced: vec3<f32>, deviation: vec3<f32>, pix: vec2<i32>, depth: f32) -> Accumulated {
+    var light = traced;
+    let fresh = Accumulated(light, 1.0, light);
     if params.temporal_blend >= 1.0 {
-        return vec4<f32>(light, 1.0);
+        return fresh;
     }
     let position = world_position(vec2<f32>(pix) + 0.5, depth);
     let clip = params.prev_clip_from_world * vec4<f32>(position, 1.0);
     if clip.w <= 0.0 {
-        return vec4<f32>(light, 1.0);
+        return fresh;
     }
     // Perspective: w is the distance along the view axis, as stored.
     let expected = clip.w;
@@ -97,6 +130,7 @@ fn accumulate(light: vec3<f32>, low: vec3<f32>, high: vec3<f32>, pix: vec2<i32>,
     let size = vec2<i32>(view_size_u());
 
     var sum = vec3<f32>(0.0);
+    var sum_recent = vec3<f32>(0.0);
     var frames = 0.0;
     var weight = 0.0;
     for (var j = 0; j < 4; j++) {
@@ -112,16 +146,26 @@ fn accumulate(light: vec3<f32>, low: vec3<f32>, high: vec3<f32>, pix: vec2<i32>,
         }
         let w = select(1.0 - f.x, f.x, off.x == 1) * select(1.0 - f.y, f.y, off.y == 1);
         sum += old.rgb * w;
+        sum_recent += textureLoad(recent_history, p, 0).rgb * w;
         frames += textureLoad(history, p, 0).a * w;
         weight += w;
     }
     if weight < 0.05 {
-        return vec4<f32>(light, 1.0);
+        return fresh;
     }
-    // (The history is in last frame's exposure.)
-    let old = clamp(sum / weight * voxels.history_scale, low, high);
     let count = min(frames / weight + 1.0, 1.0 / params.temporal_blend);
-    return vec4<f32>(mix(old, light, max(params.temporal_blend, 1.0 / count)), count);
+    let share = max(params.temporal_blend, 1.0 / count);
+    // (The history is in last frame's exposure.)
+    let old_long = sum / weight * voxels.history_scale;
+    let old_recent = sum_recent / weight * voxels.history_scale;
+    if frames / weight >= FIREFLY_FRAMES {
+        let before = max(luminance(old_long), luminance(old_recent));
+        light *= min(1.0, (before * FIREFLY_GAIN + FIREFLY_FLOOR) / max(luminance(light), 1e-6));
+    }
+    let recent = mix(old_recent, light, max(share, RECENT_BLEND));
+    let range = deviation * HISTORY_DEVIATIONS + recent * HISTORY_SLACK;
+    let old = clamp(old_long, max(recent - range, vec3<f32>(0.0)), recent + range);
+    return Accumulated(mix(old, light, share), count, recent);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -144,11 +188,6 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>) {
 
 /// Taps to each side of a pixel that `resolve` filters over.
 const FILTER_RADIUS: i32 = 2;
-/// How far from the light around a pixel, in standard deviations of it and as
-/// a share of it, the accumulated light may be before it is taken for stale.
-const HISTORY_DEVIATIONS: f32 = 2.0;
-const HISTORY_SLACK: f32 = 0.75;
-
 /// Steadies what `gather` traced, in space and then in time, and turns it into
 /// the light leaving each pixel. Here `cascade_in` is the output of `gather`.
 ///
@@ -167,6 +206,7 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     if center.a <= 0.0 || !gbuffer_valid(g) {
         textureStore(output, pix, vec4<f32>(0.0));
         textureStore(irradiance_out, pix, vec4<f32>(0.0));
+        textureStore(recent_out, pix, vec4<f32>(0.0));
         return;
     }
     let depth = textureLoad(depth_tex, pix, 0);
@@ -216,12 +256,13 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let mean = sum / weight * open;
     let deviation = sqrt(max(sum_squares / weight * open * open - mean * mean, vec3<f32>(0.0)));
-    let range = deviation * HISTORY_DEVIATIONS + mean * HISTORY_SLACK;
 
-    let accumulated = accumulate(mean, max(mean - range, vec3<f32>(0.0)), mean + range, pix, depth);
-    let light = accumulated.rgb;
+    let accumulated = accumulate(mean, deviation, pix, depth);
+    let light = accumulated.light;
     textureStore(irradiance_out, pix, vec4<f32>(light, center.a));
-    textureStore(output, pix, vec4<f32>(light * gbuffer_diffuse_color(g), accumulated.a));
+    textureStore(recent_out, pix, vec4<f32>(accumulated.recent, 1.0));
+    let to_eye = normalize(view.world_position - position);
+    textureStore(output, pix, vec4<f32>(light * gbuffer_reflectance(g, normal, to_eye), accumulated.frames));
 }
 
 /// Draws the debug view that replaces the image. Same bindings as `gather`,

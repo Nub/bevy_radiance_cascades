@@ -29,8 +29,11 @@
 //! * Perspective projections only, and the camera viewport must start at the
 //!   origin of its render target.
 
+mod emitters;
 mod node;
 mod prepare;
+
+pub use emitters::{MAX_EMITTERS, RadianceEmitter};
 
 use bevy::{
     app::{App, Plugin},
@@ -83,7 +86,8 @@ impl Plugin for RadianceCascadesPlugin {
         embedded_asset!(app, "gather.wesl");
         embedded_asset!(app, "composite.wesl");
 
-        app.register_type::<RadianceCascades>()
+        app.register_type::<RadianceEmitter>()
+            .register_type::<RadianceCascades>()
             .insert_resource(DefaultOpaqueRendererMethod::deferred());
     }
 
@@ -94,10 +98,17 @@ impl Plugin for RadianceCascadesPlugin {
 
         render_app
             .add_systems(RenderStartup, node::init_radiance_cascades_pipelines)
-            .add_systems(ExtractSchedule, extract_radiance_cascades)
+            .init_resource::<emitters::EmitterBuffer>()
+            .add_systems(
+                ExtractSchedule,
+                (extract_radiance_cascades, emitters::extract_emitters),
+            )
             .add_systems(
                 Render,
-                prepare::prepare_radiance_cascades_resources
+                (
+                    prepare::prepare_radiance_cascades_resources,
+                    emitters::prepare_emitters,
+                )
                     .in_set(RenderSystems::PrepareResources),
             )
             .add_systems(
@@ -198,6 +209,32 @@ pub struct RadianceCascades {
     /// pixels apart, and what light a crease or the foot of a thing loses to
     /// its nearest surroundings is finer than they resolve.
     pub ambient_occlusion: f32,
+    /// How much of the light arriving at a surface its specular side reflects
+    /// to the eye, on top of what its diffuse side does: 0 none, 1 all. A
+    /// metal has no diffuse side, and without this the bounced light is never
+    /// seen on it.
+    pub specular: f32,
+    /// The perceptual roughness over which [`Self::specular`] fades in. The
+    /// arriving light is all the light from in front of the surface, which is
+    /// what a rough surface reflects; a smooth one mirrors one direction, and
+    /// is left to screen-space reflections. Where the camera has those, start
+    /// this where they stop.
+    pub specular_roughness: core::ops::Range<f32>,
+    /// What the G-buffer's emissive is multiplied by to be in the units of
+    /// the lit scene. 1 for Bevy as it is; a fork that stores it scaled (the
+    /// format tops out near 65000) says by how much here.
+    pub emissive_scale: f32,
+    /// Whether the G-buffer's emissive is stored without the camera's
+    /// exposure applied. Bevy stores it as the material has it, which the
+    /// deferred lighting takes as exposed: false.
+    pub emissive_unexposed: bool,
+    /// Trace the far cascades less often than every frame: the fourth and
+    /// fifth every other frame, turn about, and those above every fourth. Far
+    /// light changes little from one frame to the next at any one place on
+    /// screen, and these cascades are most of the cost, as their rays are the
+    /// ones that leave the screen for the world cache. A light that changes
+    /// far off is a few frames late.
+    pub amortize_far: bool,
     /// Radiance of everything that is not on screen.
     pub sky_color: LinearRgba,
     /// Luminance of [`Self::sky_color`] in cd/m^2, like an ambient light's
@@ -222,7 +259,10 @@ pub struct WorldCache {
     /// Size of the finest voxels, in world units. Walls thinner than this may
     /// leak light.
     pub voxel_size: f32,
-    /// Voxels along each side of a level. A power of two.
+    /// Voxels along each side of a level: a multiple of 16, up to 256. A voxel
+    /// at some distance is between a quarter and a half of this many to that
+    /// distance, so this is what sets how fine the cache is for how far off;
+    /// memory and the cost of keeping it up to date go with its cube.
     pub resolution: u32,
     /// Number of levels, up to 8. Each covers twice the extent of the one
     /// before it with voxels twice the size; the first covers
@@ -235,6 +275,29 @@ pub struct WorldCache {
     /// Most steps a ray takes: a voxel each where there is something, a
     /// block of voxels each where there is nothing.
     pub max_steps: u32,
+    /// Leave what moves on its own out of the cache (it takes the camera
+    /// having a `MotionVectorPrepass` to tell). What moves would only be
+    /// remembered where it no longer is.
+    pub skip_moving: bool,
+    /// Experimental. A voxel stops as much of a ray as the cache is sure
+    /// there is a surface in it: it fades in as it is seen again and out as
+    /// it is seen through, instead of appearing and vanishing.
+    pub soft_occupancy: bool,
+    /// Experimental. A ray takes the color of the voxels around where it
+    /// hits, weighted by distance, and near the edge of a level that of the
+    /// next coarser one as well: fewer blocks and steps in what the cache
+    /// lights, for more texture reads per hit.
+    pub blend_lookup: bool,
+    /// Experimental. Where a finer level covers a voxel, its color is the mean
+    /// of that level's voxels in it, so that the two agree.
+    pub coarse_from_fine: bool,
+    /// Experimental. A voxel's color changes by no more than a factor of four
+    /// each time it is looked at: a glint does not make it pulse, and a light
+    /// that comes on takes a few looks to show in full.
+    pub clamp_outliers: bool,
+    /// Experimental. Voxels seen nearly edge on stop a ray partly, by how
+    /// they face it, instead of wholly or not at all on either side of a line.
+    pub soft_facing: bool,
 }
 
 impl Default for WorldCache {
@@ -245,6 +308,12 @@ impl Default for WorldCache {
             levels: 6,
             blend: 0.25,
             max_steps: 192,
+            skip_moving: true,
+            soft_occupancy: false,
+            blend_lookup: false,
+            coarse_from_fine: false,
+            clamp_outliers: false,
+            soft_facing: false,
         }
     }
 }
@@ -264,6 +333,11 @@ impl Default for RadianceCascades {
             bounce: 1.0,
             temporal_blend: 0.1,
             ambient_occlusion: 1.0,
+            specular: 1.0,
+            specular_roughness: 0.3..0.6,
+            emissive_scale: 1.0,
+            emissive_unexposed: false,
+            amortize_far: true,
             sky_color: LinearRgba::WHITE,
             sky_brightness: 80.0,
             world_cache: Some(WorldCache::default()),

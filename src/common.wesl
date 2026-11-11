@@ -9,7 +9,10 @@
 import bevy_render::view::View;
 import bevy_render::utils::octahedral_decode;
 import bevy_pbr::deferred::types::unpack_24bit_normal;
-import package::voxel::{VoxelParams, voxel_texel, voxel_mask_texel, voxel_normal, VOXEL_RADIANCE_SCALE};
+import package::voxel::{
+    VoxelParams, voxel_texel, voxel_mask_texel, voxel_normal, voxel_occupied, voxel_confidence,
+    VOXEL_RADIANCE_SCALE, VOXEL_CONFIDENCE_MAX, VOXEL_SOFT_OCCUPANCY, VOXEL_BLEND_LOOKUP, VOXEL_SOFT_FACING,
+};
 import bevy_pbr::render::rgb9e5::rgb9e5_to_vec3_;
 
 struct RcParams {
@@ -44,6 +47,14 @@ struct RcParams {
     /// How much of the screen-space ambient occlusion the indirect light
     /// takes on (0 where there is none).
     ambient_occlusion: f32,
+    /// How much of the light arriving at a surface its specular side
+    /// reflects, and the perceptual roughness over which that fades in.
+    specular: f32,
+    specular_roughness: vec2<f32>,
+    /// What the G-buffer's emissive is multiplied by to be in the units of
+    /// the lit scene, and whether the exposure is still to be applied to it.
+    emissive_scale: f32,
+    emissive_unexposed: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: RcParams;
@@ -71,6 +82,32 @@ struct RcParams {
 /// Screen-space ambient occlusion, where the camera has it: how open each
 /// pixel is to its nearest surroundings, finer than the probes resolve.
 @group(0) @binding(18) var ambient_occlusion: texture_2d<f32>;
+/// The incoming light over only the last few frames, as of last frame, and
+/// this frame's (see `accumulate` in `gather.wesl`).
+@group(0) @binding(19) var recent_history: texture_2d<f32>;
+@group(0) @binding(20) var recent_out: texture_storage_2d<rgba16float, write>;
+
+/// A flat glowing surface the rays are told of (`RadianceEmitter`).
+struct Emitter {
+    position: vec3<f32>,
+    /// How far its light reaches.
+    range: f32,
+    /// The side it shines from.
+    normal: vec3<f32>,
+    area: f32,
+    /// Its luminance, before the exposure.
+    radiance: vec3<f32>,
+    /// The box its light stays in.
+    bounds_min: vec3<f32>,
+    bounds_max: vec3<f32>,
+}
+
+struct Emitters {
+    count: u32,
+    items: array<Emitter, 64>,
+}
+
+@group(0) @binding(21) var<uniform> emitters: Emitters;
 
 const PI: f32 = 3.14159265358979;
 /// What a ray finds: rgb = radiance arriving from its interval, a =
@@ -107,6 +144,18 @@ fn oct_dir(texel: vec2<u32>, res: u32) -> vec3<f32> {
         sin(phi) * sign_not_zero(v) * s,
         z,
     );
+}
+
+/// Where in a direction map `res` texels a side a direction falls, in texels:
+/// the inverse of `oct_dir`.
+fn oct_texel(dir: vec3<f32>, res: u32) -> vec2<f32> {
+    let r = sqrt(max(1.0 - abs(dir.z), 0.0));
+    let phi = atan2(abs(dir.y), max(abs(dir.x), 1e-20));
+    let difference = r * (phi * 4.0 / PI - 1.0);
+    let sum = select(2.0 - r, r, dir.z >= 0.0);
+    let u = 0.5 * (sum - difference) * sign_not_zero(dir.x);
+    let v = 0.5 * (sum + difference) * sign_not_zero(dir.y);
+    return (vec2<f32>(u, v) * 0.5 + 0.5) * f32(res);
 }
 
 fn sign_not_zero(x: f32) -> f32 {
@@ -192,6 +241,39 @@ fn gbuffer_diffuse_color(g: vec4<u32>) -> vec3<f32> {
     let base_color = pow(unpack4x8unorm(g.r).rgb, vec3<f32>(2.2));
     let props = unpack4x8unorm(g.b);
     return base_color * (1.0 - props.g) * props.b;
+}
+
+/// How much of the light arriving at a surface leaves it towards the eye: its
+/// diffuse albedo and, where it is rough enough, what its specular side
+/// reflects of it. A metal has no diffuse side at all: without the second
+/// part the bounced light falls on it and is never seen. (The arriving light
+/// stands in for the light from around the mirrored direction, which is fair
+/// for a rough surface, whose reflection is broad; a smooth one is left to
+/// what draws sharp reflections.)
+fn gbuffer_reflectance(g: vec4<u32>, normal: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+    let base = unpack4x8unorm(g.r);
+    let base_color = pow(base.rgb, vec3<f32>(2.2));
+    let props = unpack4x8unorm(g.b);
+    let diffuse = base_color * (1.0 - props.g) * props.b;
+    if params.specular <= 0.0 {
+        return diffuse;
+    }
+    let roughness = base.a;
+    let share = params.specular
+        * smoothstep(params.specular_roughness.x, max(params.specular_roughness.y, params.specular_roughness.x + 1e-3), roughness);
+    let f0 = mix(vec3<f32>(0.16 * props.r * props.r), base_color, props.g);
+    // The split-sum environment term, as fitted by Karis for mobile.
+    let n_dot_v = saturate(dot(normal, to_eye));
+    let r = roughness * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
+    let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
+    let ab = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
+    return diffuse + (f0 * ab.x + ab.y) * props.b * share;
+}
+
+/// What glows at a pixel, in the units of the lit scene.
+fn gbuffer_emissive(g: vec4<u32>) -> vec3<f32> {
+    let scale = params.emissive_scale * select(1.0, view.exposure, params.emissive_unexposed != 0u);
+    return rgb9e5_to_vec3_(g.g) * scale;
 }
 
 /// The pixel a probe of a cascade with the given spacing sits on.
@@ -280,6 +362,66 @@ fn voxel_level_entry(p: vec3<f32>, inv_dir: vec3<f32>, level: i32) -> f32 {
     return select(1.0e30, enter, enter > 0.0 && leave >= enter);
 }
 
+fn voxel_stored(texel: vec3<i32>) -> vec3<f32> {
+    return rgb9e5_to_vec3_(textureLoad(voxel_radiance, texel, 0).r);
+}
+
+/// What a ray along `dir` that has hit the voxel `index` of a level at `p`
+/// takes from it, where `WorldCache::blend_lookup` is on: not that voxel's
+/// color alone but the colors of the voxels around the point, weighted by how
+/// near each is, so that the cache does not show as blocks in what it lights;
+/// and near the edge of the level, more and more the color of the next coarser
+/// level there, so that there is no step in the lighting where one level takes
+/// over from another.
+fn voxel_blended(p: vec3<f32>, index: vec3<i32>, level: i32, dir: vec3<f32>, own: vec3<f32>) -> vec3<f32> {
+    let n = i32(voxels.resolution);
+    let size = voxels.voxel_size * f32(1u << u32(level));
+    let g = p / size - 0.5;
+    let base = floor(g);
+    let f = g - base;
+    var sum = vec3<f32>(0.0);
+    var weight = 0.0;
+    for (var k = 0u; k < 8u; k++) {
+        let off = vec3<u32>(k & 1u, (k >> 1u) & 1u, (k >> 2u) & 1u);
+        let neighbour = vec3<i32>(base) + vec3<i32>(off);
+        let rel = neighbour - voxels.origin[level].xyz;
+        if any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(n)) {
+            continue;
+        }
+        let texel = voxel_texel(neighbour, u32(level), voxels.resolution);
+        let info = textureLoad(voxel_meta, texel, 0).r;
+        // Only what faces the ray: not the far side of a thin wall.
+        if !voxel_occupied(info) || dot(voxel_normal(info), dir) >= 0.0 {
+            continue;
+        }
+        let w3 = select(1.0 - f, f, off == vec3<u32>(1u));
+        let w = w3.x * w3.y * w3.z + 1e-3;
+        sum += voxel_stored(texel) * w;
+        weight += w;
+    }
+    var radiance = own;
+    if weight > 0.0 {
+        radiance = sum / weight;
+    }
+    if level + 1 < i32(voxels.levels) {
+        // How many voxels in from the edge of the level this is.
+        let rel = index - voxels.origin[level].xyz;
+        let inward = min(rel, vec3<i32>(n - 1) - rel);
+        let fine = saturate(f32(min(inward.x, min(inward.y, inward.z))) / 8.0);
+        if fine < 1.0 {
+            let coarse = vec3<i32>(floor(p / (size * 2.0)));
+            let coarse_rel = coarse - voxels.origin[level + 1].xyz;
+            if all(coarse_rel >= vec3<i32>(0)) && all(coarse_rel < vec3<i32>(n)) {
+                let texel = voxel_texel(coarse, u32(level + 1), voxels.resolution);
+                if voxel_occupied(textureLoad(voxel_meta, texel, 0).r) {
+                    radiance = mix(voxel_stored(texel), radiance, fine);
+                }
+            }
+        }
+    }
+    return radiance;
+}
+
 /// Traces `origin + dir * [t0, t1]` through the world cache: always in the
 /// finest level that covers where the ray is, a voxel at a time where there is
 /// something and a block of voxels at a time where the level's occupancy
@@ -290,8 +432,15 @@ fn trace_voxels(origin: vec3<f32>, dir: vec3<f32>, t0: f32, t1: f32) -> vec4<f32
     }
     let top = i32(voxels.levels) - 1;
     let inv_dir = 1.0 / select(dir, vec3<f32>(1e-12), abs(dir) < vec3<f32>(1e-12));
+    let soft_occupancy = (voxels.options & VOXEL_SOFT_OCCUPANCY) != 0u;
+    let soft_facing = (voxels.options & VOXEL_SOFT_FACING) != 0u;
+    let blend_lookup = (voxels.options & VOXEL_BLEND_LOOKUP) != 0u;
     var t = t0;
     var level = 0;
+    // What the ray has gathered so far, and how much of it is still to be
+    // stopped. (All or nothing at the first voxel, unless an option softens it.)
+    var gathered = vec3<f32>(0.0);
+    var through = 1.0;
     // The ray may start inside the voxels of the surface it left, or of one
     // that already stopped the cascades below: it has to get clear first.
     var clear = false;
@@ -310,7 +459,7 @@ fn trace_voxels(origin: vec3<f32>, dir: vec3<f32>, t0: f32, t1: f32) -> vec4<f32
         }
         if level > top {
             // Beyond what the cache covers.
-            return MISS;
+            break;
         }
         let size = voxels.voxel_size * f32(1u << u32(level));
         let index = vec3<i32>(floor(p / size));
@@ -328,18 +477,39 @@ fn trace_voxels(origin: vec3<f32>, dir: vec3<f32>, t0: f32, t1: f32) -> vec4<f32
         } else {
             let texel = voxel_texel(index, u32(level), voxels.resolution);
             let info = textureLoad(voxel_meta, texel, 0).r;
-            if info == 0u {
+            if !voxel_occupied(info) {
                 clear = true;
             } else if clear {
                 let facing = dot(voxel_normal(info), dir);
-                if facing < 0.0 {
-                    let stored = rgb9e5_to_vec3_(textureLoad(voxel_radiance, texel, 0).r);
-                    return vec4<f32>(stored * (view.exposure / VOXEL_RADIANCE_SCALE), 0.0);
+                // How much of the ray the voxel stops as a lit front, and as
+                // the back of something. (Seen nearly edge on it is neither:
+                // more likely the ray skimming a surface's own voxels.)
+                var front = select(0.0, 1.0, facing < 0.0);
+                var back = select(0.0, 1.0, facing > 0.25);
+                if soft_facing {
+                    // Gradually, so that a voxel whose normal sits on the
+                    // line does not stop the ray one frame and not the next.
+                    front = smoothstep(0.1, -0.1, facing);
+                    back = smoothstep(0.1, 0.4, facing);
                 }
-                if facing > 0.25 {
-                    // The back of something. (Shallower than that, and it is more
-                    // likely the ray skimming a surface's own voxels.)
-                    return OCCLUDED;
+                if soft_occupancy {
+                    // As far as it is sure there is anything there: a voxel
+                    // fades in as it is seen again, and out as it is seen
+                    // through, instead of appearing and vanishing.
+                    let sure = f32(voxel_confidence(info)) / f32(VOXEL_CONFIDENCE_MAX);
+                    front *= sure;
+                    back *= sure;
+                }
+                if front > 0.0 {
+                    var stored = voxel_stored(texel);
+                    if blend_lookup {
+                        stored = voxel_blended(p, index, level, dir, stored);
+                    }
+                    gathered += through * front * stored * (view.exposure / VOXEL_RADIANCE_SCALE);
+                }
+                through *= saturate(1.0 - front - back);
+                if through < 0.02 {
+                    return vec4<f32>(gathered, 0.0);
                 }
             }
         }
@@ -348,7 +518,11 @@ fn trace_voxels(origin: vec3<f32>, dir: vec3<f32>, t0: f32, t1: f32) -> vec4<f32
         let cell_size = size * f32(1u << shift);
         let cell = index >> vec3<u32>(shift);
         let exit = (vec3<f32>(cell) + vec3<f32>(dir > vec3<f32>(0.0))) * cell_size;
-        let to_exit = (exit - p) * inv_dir;
+        // (Along an axis the ray does not move on, it never leaves: a
+        // direction that lies exactly in a plane of the grid, as two in
+        // every row of the cascades' do, would otherwise find its exit
+        // behind it and creep forward a hundredth of a voxel a step.)
+        let to_exit = select((exit - p) * inv_dir, vec3<f32>(1.0e30), abs(dir) < vec3<f32>(1e-12));
         var advance = max(min(to_exit.x, min(to_exit.y, to_exit.z)), 0.0);
         if shift != 0u && level > 0 {
             // An empty block of this level may reach into a finer one, which
@@ -357,5 +531,5 @@ fn trace_voxels(origin: vec3<f32>, dir: vec3<f32>, t0: f32, t1: f32) -> vec4<f32
         }
         t += advance + size * 0.01;
     }
-    return MISS;
+    return vec4<f32>(gathered, through);
 }

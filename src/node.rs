@@ -23,8 +23,8 @@ use bevy::{
             SamplerDescriptor, ShaderStages, StorageTextureAccess, StoreOp, TextureFormat,
             TextureSampleType, TextureUsages, TextureView,
             binding_types::{
-                sampler, texture_2d, texture_3d, texture_depth_2d, texture_storage_2d,
-                texture_storage_3d, uniform_buffer,
+                sampler, storage_buffer_sized, texture_2d, texture_3d, texture_depth_2d,
+                texture_storage_2d, texture_storage_3d, uniform_buffer,
             },
         },
         renderer::{RenderContext, RenderDevice, ViewQuery},
@@ -38,6 +38,7 @@ pub struct RadianceCascadesPipelines {
     layout: BindGroupLayoutDescriptor,
     pyramid_layout: BindGroupLayoutDescriptor,
     voxel_layout: BindGroupLayoutDescriptor,
+    voxel_mark: CachedComputePipelineId,
     voxel_update: CachedComputePipelineId,
     voxel_mask_fine: CachedComputePipelineId,
     voxel_mask_coarse: CachedComputePipelineId,
@@ -88,6 +89,9 @@ pub fn init_radiance_cascades_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 texture_3d(TextureSampleType::Uint),
                 texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_storage_2d(CASCADE_FORMAT, StorageTextureAccess::WriteOnly),
+                uniform_buffer::<crate::emitters::EmitterUniform>(false),
             ),
         ),
     );
@@ -122,6 +126,8 @@ pub fn init_radiance_cascades_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 sampler(SamplerBindingType::Filtering),
                 texture_storage_3d(VOXEL_FORMAT, StorageTextureAccess::WriteOnly),
+                storage_buffer_sized(false, None),
+                texture_2d(TextureSampleType::Float { filterable: true }),
             ),
         ),
     );
@@ -215,6 +221,12 @@ pub fn init_radiance_cascades_pipelines(
         &voxel_layout,
         load_embedded_asset!(asset_server.as_ref(), "voxel_update.wesl"),
     );
+    let voxel_mark = compute_pipeline(
+        "radiance_cascades_voxel_mark_pipeline",
+        "mark",
+        &voxel_layout,
+        load_embedded_asset!(asset_server.as_ref(), "voxel_update.wesl"),
+    );
     let voxel_mask_fine = compute_pipeline(
         "radiance_cascades_voxel_mask_fine_pipeline",
         "mask_fine",
@@ -275,6 +287,7 @@ pub fn init_radiance_cascades_pipelines(
         layout,
         pyramid_layout,
         voxel_layout,
+        voxel_mark,
         voxel_update,
         voxel_mask_fine,
         voxel_mask_coarse,
@@ -306,6 +319,7 @@ pub fn radiance_cascades(
     pipelines: Option<Res<RadianceCascadesPipelines>>,
     pipeline_cache: Res<PipelineCache>,
     view_uniforms: Res<ViewUniforms>,
+    emitters: Res<crate::emitters::EmitterBuffer>,
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
@@ -313,6 +327,9 @@ pub fn radiance_cascades(
         view.into_inner();
 
     let Some(pipelines) = pipelines else {
+        return;
+    };
+    let Some(emitters) = emitters.0.binding() else {
         return;
     };
     if view_target.main_texture_format() != TextureFormat::Rgba16Float {
@@ -334,6 +351,7 @@ pub fn radiance_cascades(
         pipelines.composite_add
     };
     let (
+        Some(voxel_mark_pipeline),
         Some(voxel_update_pipeline),
         Some(voxel_mask_fine_pipeline),
         Some(voxel_mask_coarse_pipeline),
@@ -349,6 +367,7 @@ pub fn radiance_cascades(
         Some(gbuffer),
         Some(view_uniforms),
     ) = (
+        pipeline_cache.get_compute_pipeline(pipelines.voxel_mark),
         pipeline_cache.get_compute_pipeline(pipelines.voxel_update),
         pipeline_cache.get_compute_pipeline(pipelines.voxel_mask_fine),
         pipeline_cache.get_compute_pipeline(pipelines.voxel_mask_coarse),
@@ -414,6 +433,9 @@ pub fn radiance_cascades(
                     motion_vectors,
                     &voxels.mask,
                     occlusion,
+                    resources.previous_recent(),
+                    resources.recent(),
+                    emitters.clone(),
                 )),
             )
         })
@@ -423,40 +445,52 @@ pub fn radiance_cascades(
     // the gather traced in its place, and accumulates last frame's incoming
     // light into this frame's. The debug views, drawn after it, read the
     // result (and write nothing to the other).
-    let gather_bind_group =
-        |source: &TextureView, output: &TextureView, read: &TextureView, write: &TextureView| {
-            render_device.create_bind_group(
-                "radiance_cascades_gather_bind_group",
-                &layout,
-                &BindGroupEntries::sequential((
-                    cascades[0].uniform.as_entire_binding(),
-                    view_uniforms.clone(),
-                    depth,
-                    gbuffer,
-                    scene_color,
-                    history,
-                    source,
-                    &pipelines.sampler,
-                    output,
-                    &resources.pyramid,
-                    voxels.uniform.as_entire_binding(),
-                    &voxels.radiance,
-                    &voxels.meta,
-                    &resources.color_pyramid,
-                    read,
-                    write,
-                    motion_vectors,
-                    &voxels.mask,
-                    occlusion,
-                )),
-            )
+    let gather_bind_group = |source: &TextureView,
+                             output: &TextureView,
+                             read: &TextureView,
+                             write: &TextureView,
+                             swap: bool| {
+        let (read_recent, write_recent) = if swap {
+            (resources.recent(), resources.previous_recent())
+        } else {
+            (resources.previous_recent(), resources.recent())
         };
+        render_device.create_bind_group(
+            "radiance_cascades_gather_bind_group",
+            &layout,
+            &BindGroupEntries::sequential((
+                cascades[0].uniform.as_entire_binding(),
+                view_uniforms.clone(),
+                depth,
+                gbuffer,
+                scene_color,
+                history,
+                source,
+                &pipelines.sampler,
+                output,
+                &resources.pyramid,
+                voxels.uniform.as_entire_binding(),
+                &voxels.radiance,
+                &voxels.meta,
+                &resources.color_pyramid,
+                read,
+                write,
+                motion_vectors,
+                &voxels.mask,
+                occlusion,
+                read_recent,
+                write_recent,
+                emitters.clone(),
+            )),
+        )
+    };
     let debug_bind_group = resources.debug_view.as_ref().map(|output| {
         gather_bind_group(
             &cascades[0].view,
             output,
             resources.irradiance(),
             resources.previous_irradiance(),
+            true,
         )
     });
     let resolve_bind_group = gather_bind_group(
@@ -464,12 +498,14 @@ pub fn radiance_cascades(
         resources.indirect(),
         resources.previous_irradiance(),
         resources.irradiance(),
+        false,
     );
     let gather_bind_group = gather_bind_group(
         &cascades[0].view,
         &resources.raw_irradiance,
         resources.previous_irradiance(),
         resources.irradiance(),
+        false,
     );
 
     // Level 0 of the color pyramid is reduced from the lit scene, level `n`
@@ -507,6 +543,8 @@ pub fn radiance_cascades(
             &resources.color_pyramid,
             &pipelines.sampler,
             &voxels.mask,
+            voxels.marks.as_entire_binding(),
+            motion_vectors,
         )),
     );
 
@@ -593,10 +631,15 @@ pub fn radiance_cascades(
     // frame in it. (It reads the color pyramid.)
     if voxels.levels > 0 {
         let span = diagnostics.time_span(command_encoder, "rc_voxels");
+        command_encoder.clear_buffer(&voxels.marks, 0, None);
         let mut pass = compute_pass(command_encoder, "radiance_cascades_voxels");
+        // Every pixel marks the voxel its surface lies in; then the voxels
+        // are brought up to date with that.
+        pass.set_pipeline(voxel_mark_pipeline);
+        pass.set_bind_group(0, &voxel_bind_group, &[view_uniform_offset.offset]);
+        pass.dispatch_workgroups(view_groups.x, view_groups.y, 1);
         let groups = voxels.resolution.div_ceil(4);
         pass.set_pipeline(voxel_update_pipeline);
-        pass.set_bind_group(0, &voxel_bind_group, &[view_uniform_offset.offset]);
         pass.dispatch_workgroups(groups, groups, groups);
         // And what that leaves of the level's blocks of voxels.
         let fine_groups = (voxels.resolution / 4).div_ceil(4);
@@ -625,6 +668,9 @@ pub fn radiance_cascades(
     ];
     for (index, (level, bind_group)) in cascades.iter().zip(&cascade_bind_groups).enumerate().rev()
     {
+        if resources.kept_cascades & (1 << index) != 0 {
+            continue;
+        }
         let span = diagnostics.time_span(
             command_encoder,
             CASCADE_SPANS[index.min(CASCADE_SPANS.len() - 1)],

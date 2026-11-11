@@ -2,14 +2,22 @@
 //! this frame. A voxel that has a visible surface in it takes that surface's
 //! lit color; one the camera sees clean through is emptied; one that is
 //! hidden or off screen keeps what it remembered.
+//!
+//! In two steps. `mark`: every pixel of the scene's geometry marks the voxel
+//! its surface lies in. `update`: every voxel that was marked has a surface in
+//! it, and the rest look whether the camera sees through them. (Asking each
+//! voxel instead whether a surface shows at a few points of it, as this once
+//! did, misses what lies between the points and, where a surface only just
+//! reaches a point, finds it one frame and not the next.)
 
 import bevy_render::view::View;
 import bevy_render::utils::octahedral_decode;
 import bevy_pbr::deferred::types::unpack_24bit_normal;
 import bevy_pbr::render::rgb9e5::{vec3_to_rgb9e5_, rgb9e5_to_vec3_};
 import package::voxel::{
-    VoxelParams, voxel_texel, pack_voxel_meta, voxel_normal, voxel_strength,
-    VOXEL_RADIANCE_SCALE, VOXEL_STRENGTH_MASK, VOXEL_STRENGTH_SHIFT,
+    VoxelParams, voxel_texel, pack_voxel_meta, voxel_normal, voxel_confidence, voxel_occupied,
+    VOXEL_RADIANCE_SCALE, VOXEL_OCCUPIED, VOXEL_CONFIDENCE_MASK, VOXEL_CONFIDENCE_SHIFT, VOXEL_CONFIDENCE_MAX,
+    VOXEL_SKIP_MOVING, VOXEL_COARSE_FROM_FINE, VOXEL_CLAMP_OUTLIERS,
 };
 
 @group(0) @binding(0) var<uniform> voxels: VoxelParams;
@@ -25,9 +33,74 @@ import package::voxel::{
 @group(0) @binding(9) var linear_sampler: sampler;
 /// Which blocks of voxels have anything in them (see `voxel_mask_texel`).
 @group(0) @binding(10) var voxel_mask: texture_storage_3d<r32uint, write>;
+/// For each texel of the level being updated: 0, or one more than the index
+/// of a pixel whose surface lies in its voxel.
+@group(0) @binding(11) var<storage, read_write> marks: array<atomic<u32>>;
+/// How far each pixel has moved across the view since last frame, in UV.
+@group(0) @binding(12) var motion_vectors: texture_2d<f32>;
 
 /// rgb9e5 tops out here.
 const MAX_VOXEL_RADIANCE: f32 = 65000.0;
+/// How far, in pixels, something may move across the view on its own in a
+/// frame and still be taken for part of the standing world.
+const STILL: f32 = 0.75;
+
+fn world_at(pix: vec2<i32>, depth: f32) -> vec3<f32> {
+    let uv = (vec2<f32>(pix) + 0.5) / view.main_pass_viewport.zw;
+    let p = view.world_from_clip * vec4<f32>((uv - 0.5) * vec2<f32>(2.0, -2.0), depth, 1.0);
+    return p.xyz / p.w;
+}
+
+/// Whether what shows at a pixel, at `p`, is moving on its own: across the
+/// view otherwise than the camera's own movement takes the world. What moves
+/// is left out of the cache. It would only ever be remembered where it no
+/// longer is, and the screen shows where it is for as long as it is in view.
+fn moving(pix: vec2<i32>, p: vec3<f32>) -> bool {
+    if voxels.has_motion_vectors == 0u || (voxels.options & VOXEL_SKIP_MOVING) == 0u {
+        return false;
+    }
+    let now = view.unjittered_clip_from_world * vec4<f32>(p, 1.0);
+    let before = voxels.prev_clip_from_world * vec4<f32>(p, 1.0);
+    if now.w <= 0.0 || before.w <= 0.0 {
+        return false;
+    }
+    let with_camera = (now.xy / now.w - before.xy / before.w) * vec2<f32>(0.5, -0.5);
+    let motion = textureLoad(motion_vectors, pix, 0).rg;
+    return length((motion - with_camera) * view.main_pass_viewport.zw) > STILL;
+}
+
+/// Every pixel that shows the scene's standing geometry marks the voxel (of
+/// the level being updated) that its surface lies in.
+@compute @workgroup_size(8, 8, 1)
+fn mark(@builtin(global_invocation_id) id: vec3<u32>) {
+    let view_size = vec2<u32>(view.main_pass_viewport.zw);
+    if any(id.xy >= view_size) {
+        return;
+    }
+    let pix = vec2<i32>(id.xy);
+    let depth = textureLoad(depth_tex, pix, 0);
+    // Not the background, nor what is drawn without the deferred prepass
+    // (effects, overlays, the odd forward mesh).
+    if depth <= 0.0 || textureLoad(gbuffer_tex, pix, 0).a == 0u {
+        return;
+    }
+    let p = world_at(pix, depth);
+    if moving(pix, p) {
+        return;
+    }
+    let n = i32(voxels.resolution);
+    let level = voxels.update_level;
+    let size = voxels.voxel_size * f32(1u << level);
+    let index = vec3<i32>(floor(p / size));
+    let rel = index - voxels.origin[level].xyz;
+    if any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(n)) {
+        return;
+    }
+    let local = ((index % n) + n) % n;
+    // (The greatest index of them all: the same pixel from frame to frame,
+    // while the view is still.)
+    atomicMax(&marks[u32(local.x + n * (local.y + n * local.z))], id.x + id.y * view_size.x + 1u);
+}
 
 @compute @workgroup_size(4, 4, 4)
 fn update(@builtin(global_invocation_id) id: vec3<u32>) {
@@ -43,100 +116,58 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     let index = origin + (((local - origin) % n) + n) % n;
     let prev_index = prev_origin + (((local - prev_origin) % n) + n) % n;
     let texel = voxel_texel(index, level, voxels.resolution);
+    let marked = atomicLoad(&marks[u32(local.x + n * (local.y + n * local.z))]);
 
     var radiance = vec3<f32>(0.0);
     var info = 0u;
     if all(index == prev_index) {
         info = textureLoad(voxel_meta, texel).r;
         radiance = rgb9e5_to_vec3_(textureLoad(voxel_radiance, texel).r);
+    } else if marked == 0u {
+        // Scrolled in, and nothing shows in it.
+        textureStore(voxel_meta, texel, vec4<u32>(0u));
+        textureStore(voxel_radiance, texel, vec4<u32>(0u));
+        return;
+    }
+    if marked == 0u && info == 0u {
+        // Empty, and still empty.
+        return;
     }
 
     let size = voxels.voxel_size * f32(1u << level);
     let view_size = view.main_pass_viewport.zw;
     let near = view.clip_from_view[3][2];
-    // The voxel is observed at the centres of its eight octants. Each stands
-    // for a ball of this radius.
-    let reach = size * 0.433;
-
-    let to_stored = VOXEL_RADIANCE_SCALE / max(view.exposure, 1e-12);
-    // Nothing to observe for a voxel that is entirely off screen.
     let center = (vec3<f32>(index) + 0.5) * size;
-    var on_screen = true;
-    for (var plane = 0u; plane < 5u; plane++) {
-        let half_space = view.frustum[plane];
-        on_screen = on_screen && dot(half_space.xyz, center) + half_space.w > -size;
-    }
 
-    var found = 0.0;
-    var seen_through = 0u;
-    var found_radiance = vec3<f32>(0.0);
-    var found_normal = vec3<f32>(0.0);
-    for (var k = 0u; k < select(0u, 8u, on_screen); k++) {
-        let octant = vec3<f32>(vec3<u32>(k & 1u, (k >> 1u) & 1u, (k >> 2u) & 1u));
-        let p = (vec3<f32>(index) + 0.25 + 0.5 * octant) * size;
-        let clip = view.clip_from_world * vec4<f32>(p, 1.0);
-        if clip.w <= near {
-            continue;
+    if marked != 0u {
+        // A surface shows in it, at this pixel among others.
+        let width = u32(view_size.x);
+        let pix = vec2<i32>(vec2<u32>((marked - 1u) % width, (marked - 1u) / width));
+        let distance = near / max(textureLoad(depth_tex, pix, 0), 1e-12);
+        // Lit color now, over as much of the screen as a part of the voxel
+        // covers: a single pixel of it is a different one every time the view
+        // moves or is jittered, and the voxel would flicker between them.
+        // (Level 0 of the color pyramid is two pixels a texel.)
+        let across = size * 0.25 * view.clip_from_view[1][1] * view_size.y / distance;
+        let lod = clamp(log2(max(across, 1.0)) - 1.0, 0.0, f32(textureNumLevels(color_pyramid)) - 1.0);
+        let filtered = textureSampleLevel(color_pyramid, linear_sampler, (vec2<f32>(pix) + 0.5) * 0.5 / vec2<f32>(textureDimensions(color_pyramid, 0)), lod);
+        var color = textureLoad(scene_color, pix, 0).rgb;
+        if filtered.a > 0.05 {
+            color = filtered.rgb / filtered.a;
         }
-        let ndc = clip.xy / clip.w;
-        if any(abs(ndc) >= vec2<f32>(1.0)) {
-            continue;
+        // Plus the indirect light it had last frame.
+        color += voxels.history_scale * textureLoad(history, pix, 0).rgb;
+        let to_stored = VOXEL_RADIANCE_SCALE / max(view.exposure, 1e-12);
+        var observed = clamp(color * to_stored, vec3<f32>(0.0), vec3<f32>(MAX_VOXEL_RADIANCE));
+        if info != 0u && (voxels.options & VOXEL_CLAMP_OUTLIERS) != 0u {
+            // No more than so much brighter or darker in one look: a glint that
+            // lands on the pixel for a frame does not make the voxel pulse.
+            observed = clamp(observed, radiance * 0.25, radiance * 4.0 + 1.0);
         }
-        let pix = vec2<i32>((ndc * vec2<f32>(0.5, -0.5) + 0.5) * view_size);
-        let depth = textureLoad(depth_tex, pix, 0);
-        if depth <= 0.0 {
-            // Nothing but background behind it.
-            seen_through += 1u;
-            continue;
-        }
-        // How far the point is from the surface seen through its pixel. Along
-        // the surface's normal where there is one: measured along the view ray,
-        // a surface seen at a grazing angle would seem far from its own voxels.
-        let g = textureLoad(gbuffer_tex, pix, 0);
-        if g.a == 0u {
-            // Not the scene's geometry (what is drawn without the deferred
-            // prepass: effects, overlays, the odd forward mesh). It is no
-            // voxel, and what is behind it cannot be seen.
-            continue;
-        }
-        let uv = (vec2<f32>(pix) + 0.5) / view_size;
-        let surface = view.world_from_clip * vec4<f32>((uv - 0.5) * vec2<f32>(2.0, -2.0), depth, 1.0);
-        let normal = octahedral_decode(unpack_24bit_normal(g.a));
-        let distance = dot(normal, p - surface.xyz / surface.w);
-        // Near the surface's plane is not enough: the plane goes on where the
-        // surface does not (past the edge of a table seen from the side), and
-        // would leave voxels hanging in the air there. What is seen through
-        // the pixel has to be about here along the view as well.
-        let along_view = abs(near / depth - clip.w);
-        if abs(distance) <= reach && along_view <= size * 3.0 {
-            // Lit color now, over as much of the screen as this part of the
-            // voxel covers: a single pixel of it is a different one every time
-            // the view moves or is jittered, and the voxel would flicker
-            // between them. (Level 0 of the color pyramid is two pixels a texel.)
-            let width = size * 0.25 * view.clip_from_view[1][1] * view_size.y / clip.w;
-            let lod = clamp(log2(max(width, 1.0)) - 1.0, 0.0, f32(textureNumLevels(color_pyramid)) - 1.0);
-            let filtered = textureSampleLevel(color_pyramid, linear_sampler, (vec2<f32>(pix) + 0.5) * 0.5 / vec2<f32>(textureDimensions(color_pyramid, 0)), lod);
-            var color = textureLoad(scene_color, pix, 0).rgb;
-            if filtered.a > 0.05 {
-                color = filtered.rgb / filtered.a;
-            }
-            // Plus the indirect light it had last frame.
-            color += voxels.history_scale * textureLoad(history, pix, 0).rgb;
-            color = clamp(color * to_stored, vec3<f32>(0.0), vec3<f32>(MAX_VOXEL_RADIANCE));
-            found_radiance += color;
-            found_normal += normal;
-            found += 1.0;
-        } else if clip.w < near / depth {
-            seen_through += 1u;
-        }
-    }
-
-    if found > 0.0 {
-        let observed = found_radiance / found;
         // Blend, so a voxel does not flicker between the pixels that land in it.
         radiance = select(observed, mix(radiance, observed, voxels.blend), info != 0u);
-        let length_sq = dot(found_normal, found_normal);
-        var normal = select(normalize(view.world_position - center), found_normal * inverseSqrt(length_sq), length_sq > 1e-6);
+
+        var normal = octahedral_decode(unpack_24bit_normal(textureLoad(gbuffer_tex, pix, 0).a));
         if info != 0u {
             // Which way it faces settles like its color does, or rays would
             // take it for a front one update and a back the next.
@@ -144,20 +175,82 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
             let settled_sq = dot(settled, settled);
             normal = select(normal, settled * inverseSqrt(settled_sq), settled_sq > 1e-6);
         }
-        // Seen again: better established, up to a point.
-        info = pack_voxel_meta(normal, select(2u, voxel_strength(info) + 1u, info != 0u));
-    } else if seen_through == 8u && info != 0u {
-        // Seen clean through. Along the edges of things a voxel is seen and
-        // then seen through from one frame to the next, as the view is
-        // jittered or creeps: one that emptied at the first look through it
-        // would flash. The coarse levels are looked at too seldom to wait.
-        let strength = voxel_strength(info);
-        let drop = 1u << min(level, 2u);
-        if strength <= drop {
-            info = 0u;
-            radiance = vec3<f32>(0.0);
-        } else {
-            info = (info & ~VOXEL_STRENGTH_MASK) | ((strength - drop) << VOXEL_STRENGTH_SHIFT);
+        // Seen: surer of it, and once sure enough rays find it. The fine
+        // levels, which are looked at every few frames, wait for a second
+        // sighting; the coarse ones are looked at too seldom to.
+        let confidence = min(voxel_confidence(info) + 2u, VOXEL_CONFIDENCE_MAX);
+        let enough = select(2u, 4u, level <= 2u);
+        info = pack_voxel_meta(normal, confidence, voxel_occupied(info) || confidence >= enough);
+    } else {
+        // Nothing shows in it. Does the camera see clean through it? Asked at
+        // the centres of its eight octants, of all of which it has to be true.
+        var on_screen = true;
+        for (var plane = 0u; plane < 5u; plane++) {
+            let half_space = view.frustum[plane];
+            on_screen = on_screen && dot(half_space.xyz, center) + half_space.w > -size;
+        }
+        var seen_through = 0u;
+        for (var k = 0u; k < select(0u, 8u, on_screen); k++) {
+            let octant = vec3<f32>(vec3<u32>(k & 1u, (k >> 1u) & 1u, (k >> 2u) & 1u));
+            let p = (vec3<f32>(index) + 0.25 + 0.5 * octant) * size;
+            let clip = view.clip_from_world * vec4<f32>(p, 1.0);
+            if clip.w <= near {
+                break;
+            }
+            let ndc = clip.xy / clip.w;
+            if any(abs(ndc) >= vec2<f32>(1.0)) {
+                break;
+            }
+            let pix = vec2<i32>((ndc * vec2<f32>(0.5, -0.5) + 0.5) * view_size);
+            let depth = textureLoad(depth_tex, pix, 0);
+            if depth > 0.0 {
+                // Something shows behind the point, or in front of it. In
+                // front, it hides the point. And what is not the scene's
+                // standing geometry (see `mark`) says nothing of what is
+                // behind it either way: it may be standing in the voxel.
+                if clip.w >= near / depth || textureLoad(gbuffer_tex, pix, 0).a == 0u || moving(pix, world_at(pix, depth)) {
+                    break;
+                }
+            }
+            seen_through += 1u;
+        }
+        if seen_through == 8u {
+            // Seen clean through: less sure of it, and gone once not at all.
+            // (A sighting counts for two looks through, so a voxel that is
+            // seen as often as not stays.) The coarser the level the fewer
+            // looks it takes, so that what has moved away is forgotten about
+            // as fast in all of them.
+            let confidence = voxel_confidence(info);
+            let drop = select(VOXEL_CONFIDENCE_MAX, level + 1u, level <= 2u);
+            if confidence <= drop {
+                info = 0u;
+                radiance = vec3<f32>(0.0);
+            } else {
+                info = (info & ~VOXEL_CONFIDENCE_MASK) | ((confidence - drop) << VOXEL_CONFIDENCE_SHIFT);
+            }
+        }
+    }
+
+    if info != 0u && level > 0u && (voxels.options & VOXEL_COARSE_FROM_FINE) != 0u {
+        // Where the next finer level covers this voxel, its color is the mean
+        // of what that level holds in it, so that the two agree on it.
+        let finer = level - 1u;
+        var sum = vec3<f32>(0.0);
+        var count = 0.0;
+        for (var k = 0u; k < 8u; k++) {
+            let child = index * 2 + vec3<i32>(vec3<u32>(k & 1u, (k >> 1u) & 1u, (k >> 2u) & 1u));
+            let rel = child - voxels.origin[finer].xyz;
+            if any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(n)) {
+                continue;
+            }
+            let child_texel = voxel_texel(child, finer, voxels.resolution);
+            if voxel_occupied(textureLoad(voxel_meta, child_texel).r) {
+                sum += rgb9e5_to_vec3_(textureLoad(voxel_radiance, child_texel).r);
+                count += 1.0;
+            }
+        }
+        if count > 0.0 {
+            radiance = sum / count;
         }
     }
 
@@ -176,7 +269,7 @@ fn block_occupied(base: vec3<i32>, side: i32) -> u32 {
             }
         }
     }
-    return select(0u, 1u, any_info != 0u);
+    return select(0u, 1u, (any_info & VOXEL_OCCUPIED) != 0u);
 }
 
 /// Brings the fine occupancy mask of the level just updated up to date: one

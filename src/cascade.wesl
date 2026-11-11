@@ -3,10 +3,10 @@
 //! Dispatched from the top cascade down.
 
 import package::common::{
-    params, view, depth_tex, gbuffer_tex, scene_color, history, cascade_in, linear_sampler, output,
+    params, view, emitters, oct_texel, PI, depth_tex, gbuffer_tex, scene_color, history, cascade_in, linear_sampler, output,
     depth_pyramid, color_pyramid, voxels, trace_voxels, MISS,
     oct_dir, view_size_f, linear_depth, pixel_footprint, ndc_to_pixel, world_position,
-    gbuffer_normal, gbuffer_valid, surface_normal, probe_pixel, probe_weights, probe_index, MAX_RADIANCE,
+    gbuffer_normal, gbuffer_valid, gbuffer_emissive, surface_normal, probe_pixel, probe_weights, probe_index, MAX_RADIANCE,
 };
 import bevy_pbr::render::rgb9e5::rgb9e5_to_vec3_;
 
@@ -83,8 +83,12 @@ fn shade_hit(pix: vec2<i32>, pixel: vec2<f32>, width: f32, dir: vec3<f32>) -> ve
         // it reaches the near side. (Bevy keeps emissive in the same exposed
         // units as the lit scene.) The two meet gradually: a hard line between
         // them is a hard line across everything the surface lights.
+        // (No more of the glow than the ray's cone sees of the lit scene
+        // there: the glow is this one pixel's, and a wide ray that happens on
+        // a pixel of a thin glowing trim would take all of it for the trim's
+        // brightness, one frame in a few as the view is jittered.)
         let behind = smoothstep(-0.2, 0.2, dot(gbuffer_normal(g), dir));
-        radiance = mix(radiance, rgb9e5_to_vec3_(g.g), behind);
+        radiance = mix(radiance, min(gbuffer_emissive(g), radiance), behind);
     }
     radiance += bounced_radiance(pix, depth);
     // Also swallows NaNs: min/max return the non-NaN operand.
@@ -174,7 +178,8 @@ fn trace(origin: vec3<f32>, dir: vec3<f32>, t0: f32, t1: f32, probe_pixel: vec2<
         let cell_size = f32(1u << u32(level));
         let cell = floor(p / cell_size);
         let exit = (cell + vec2<f32>(step_dir > vec2<f32>(0.0))) * cell_size;
-        let to_exit = (exit - p) * inv_dir;
+        // (Along an axis the line does not move on, it never leaves.)
+        let to_exit = select((exit - p) * inv_dir, vec2<f32>(1.0e30), abs(step_dir) < vec2<f32>(1e-12));
         let s_end = min(s + EPS + max(min(to_exit.x, to_exit.y), 0.0), len);
 
         let z_a = max(mix(p0.z, p1.z, s * inv_len), 1e-12);
@@ -238,6 +243,110 @@ fn merge_upper(pixel: vec2<f32>, position: vec3<f32>, normal: vec3<f32>, footpri
         radiance += weights.w[j] * textureSampleLevel(cascade_in, linear_sampler, uv, 0.0).rgb;
     }
     return radiance;
+}
+
+/// How far short of an emitter the rays that look for what stands before it
+/// stop, in world units: what holds it (its housing, the ceiling it hangs
+/// from) is not in its way.
+const EMITTER_CLEARANCE: f32 = 0.3;
+/// An emitter lights a surface if the point this far off it, in world units,
+/// is in the emitter's box, and nothing by this far out of it. The walls of
+/// its room stand on the box, or a little outside it, and their faces look
+/// in: lifted off them, the point is inside. Measured at the surface itself
+/// with as much allowance, the floor of the next room was lit along the foot
+/// of the wall between them, and whatever stood there.
+const EMITTER_BOUNDS_LIFT: f32 = 0.5;
+const EMITTER_BOUNDS_NONE: f32 = 0.1;
+
+/// How much of an emitter at `distance` falls to a cascade whose interval
+/// starts at `start`, as against the one below it. Not all or nothing at the
+/// border: where a probe stands shifts a little with every frame's jitter, and
+/// an emitter that went from one cascade to the next with it changed hands
+/// between rays that see it differently, and between cascades that are not
+/// all traced in the same frame, which then both had it or neither.
+fn emitter_share(distance: f32, start: f32) -> f32 {
+    return smoothstep(start * 0.8, start * 1.25, distance);
+}
+
+/// The light of the emitters the rays are told of (`RadianceEmitter`) that
+/// falls to this ray: of those whose distance is in its interval, a share by
+/// how near its direction is to theirs. An emitter is mostly smaller than a
+/// texel of the direction map, so no ray would hit it but by chance: instead
+/// its light, all of what it sends this way, is shared out among the texels
+/// around its direction, each of whose rays says whether it is in sight.
+fn emitted(
+    position: vec3<f32>,
+    normal: vec3<f32>,
+    dir_texel: vec2<u32>,
+    ray_dir: vec3<f32>,
+    t0: f32,
+    t1: f32,
+    last: bool,
+    screen: Trace,
+) -> vec3<f32> {
+    var light = vec3<f32>(0.0);
+    let res = params.dir_res;
+    // The solid angle of a texel of the direction map.
+    let texel_angle = 4.0 * PI / f32(res * res);
+    for (var i = 0u; i < emitters.count; i++) {
+        let emitter = emitters.items[i];
+        // Only what is in its box (its room).
+        let lifted = position + normal * EMITTER_BOUNDS_LIFT;
+        let outside = max(emitter.bounds_min - lifted, lifted - emitter.bounds_max);
+        let out = max(outside.x, max(outside.y, outside.z));
+        if out >= EMITTER_BOUNDS_NONE {
+            continue;
+        }
+        let to = emitter.position - position;
+        let distance = length(to);
+        if distance >= emitter.range || distance < 1e-4 {
+            continue;
+        }
+        // This cascade's part of it: what is left of it after the one below,
+        // less what the one above takes.
+        var part = 1.0;
+        if params.cascade_index > 0u {
+            part = emitter_share(distance, t0);
+        }
+        if !last {
+            part *= 1.0 - emitter_share(distance, t1);
+        }
+        if part <= 0.0 {
+            continue;
+        }
+        let towards = to / distance;
+        let facing = dot(emitter.normal, -towards);
+        // (Nor does it light a surface from behind.)
+        if facing <= 0.0 || dot(normal, towards) <= 0.0 {
+            continue;
+        }
+        let at = oct_texel(towards, res) - (vec2<f32>(dir_texel) + 0.5);
+        let share = max(1.0 - abs(at.x), 0.0) * max(1.0 - abs(at.y), 0.0);
+        if share <= 0.0 {
+            continue;
+        }
+        // Whether anything stands before it along this ray: on screen, or
+        // where the screen cannot say, in the world cache.
+        let reach = distance - max(EMITTER_CLEARANCE, voxels.voxel_size * 1.5);
+        var sight = 1.0;
+        if screen.result.a < 1.0 && screen.distance < reach {
+            sight = 0.0;
+        } else if screen.unknown && screen.unknown_from < reach && voxels.levels > 0u {
+            let start = max(max(t0, voxels.voxel_size * 1.5), screen.unknown_from - voxels.voxel_size * 2.0);
+            if reach > start {
+                sight = trace_voxels(position + normal * voxels.voxel_size, ray_dir, start, reach).a;
+            }
+        }
+        if sight <= 0.0 {
+            continue;
+        }
+        // (Softened where it is nearer than it is wide, and at its range.)
+        let angle = emitter.area * facing / (distance * distance + emitter.area);
+        var fade = 1.0 - smoothstep(0.75 * emitter.range, emitter.range, distance);
+        fade *= 1.0 - smoothstep(0.0, EMITTER_BOUNDS_NONE, out);
+        light += emitter.radiance * (view.exposure * angle / texel_angle * share * sight * fade * part);
+    }
+    return min(light, vec3<f32>(MAX_RADIANCE));
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -309,6 +418,7 @@ fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
             result = trace_voxels(position + normal * voxels.voxel_size, ray_dir, start, t1);
         }
     }
+    result = vec4<f32>(result.rgb + emitted(position, normal, dir_texel, ray_dir, t0, t1, last, screen), result.a);
     if result.a > 0.0 {
         if last {
             result = vec4<f32>(result.rgb + result.a * sky, 1.0);

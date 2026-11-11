@@ -73,7 +73,10 @@ does change from frame to frame is the view itself, when it is jittered for TAA
 or DLSS: small lights are drawn differently every frame. So the light each
 pixel receives is averaged with its neighbours on the same surface and blended
 over a few frames (`temporal_blend`, reprojected with motion vectors where the
-camera has them); set it to 1 to show every frame as traced.
+camera has them); set it to 1 to show every frame as traced. What has
+accumulated is held within reach of the light of the last few frames, so a
+light that goes out is gone in about five frames, and a frame that is far
+brighter than what came before it is taken for a stray sample and held back.
 
 ## Settings
 
@@ -89,18 +92,51 @@ All on the `RadianceCascades` component; see its docs for detail.
 | `bounce` | 1 | 1 for physically correct multiple bounces, 0 for one. |
 | `temporal_blend` | 0.1 | How much of each frame's light shows. Lower is steadier under TAA/DLSS jitter, slower to follow changing lights; 1 is no accumulation. |
 | `ambient_occlusion` | 1 | How much of the camera's `ScreenSpaceAmbientOcclusion`, if it has one, darkens the indirect light in creases and contacts the probes are too coarse for. |
+| `specular` | 1 | How much of the arriving light a surface's specular side reflects to the eye. Metals have no diffuse side: without it the bounced light does not show on them. |
+| `specular_roughness` | 0.3..0.6 | The perceptual roughness over which `specular` fades in. Smoother surfaces are left to screen-space reflections. |
+| `emissive_scale`, `emissive_unexposed` | 1, off | For a Bevy fork that stores the G-buffer's emissive scaled or without the exposure applied. |
+| `amortize_far` | on | Traces the far cascades every second or fourth frame instead of every one. Far light is a few frames late; the cost falls by about a third. |
 | `sky_color`, `sky_brightness` | white, 80 | What rays that escape everything see. Set the brightness to 0 indoors. |
 | `world_cache` | on | `None` for purely screen-space lighting. |
 | `debug` | off | `Indirect`, `Irradiance`, `Surfaces` (what the cascades know of the scene), `WorldCache`. |
 
+## Lamps the camera has not seen
+
+The cascades light the scene with what is on screen and what the world cache
+remembers. A lamp that has never been in view lights nothing until it is, and
+one in view lights only as bright as it is drawn. Put a `RadianceEmitter` on a
+lamp's lit face to hand it to the cascades outright:
+
+```rust
+commands.spawn((
+    Mesh3d(face),
+    MeshMaterial3d(glowing),
+    RadianceEmitter {
+        radiance: LinearRgba::rgb(40_000.0, 40_000.0, 36_000.0), // cd/m^2
+        area: 0.36,
+        normal: Dir3::NEG_Y,
+        range: 30.0,
+        // The room it hangs in, relative to it: its light stays inside.
+        bounds: Some((Vec3::new(-4.0, -3.0, -4.0), Vec3::new(4.0, 0.5, 4.0))),
+    },
+));
+```
+
+It lights like a flat emissive surface of that luminance and area, from
+wherever it is, and the mesh's own glow can be whatever looks right on screen.
+The 64 nearest the camera count. What stands between an emitter and a surface
+is known only where the camera has looked, so give each its room as `bounds`,
+or it lights the next room through a wall nobody has seen yet.
+
 ## Cost
 
-Measured in a real game scene on an RTX 5090 at 2560x1440, at an earlier
-revision: 1.7 ms screen-space only, 3.4 ms with the world cache. It has not
-been measured again since the world cache's ray tracing and the resolve pass
-changed. The cost does not depend on the number of lights or emissive
-surfaces. With `RenderDiagnosticsPlugin`, each stage reports its own GPU time
-(`rc_pyramids`, `rc_voxels`, `rc_cascade_NN`, `rc_gather`, `rc_resolve`).
+Measured in a real game scene (an interior of `h4ck`) on an RTX 5090, rendering
+1280x720 upscaled to 2560x1440 with DLSS, world cache on, 8 levels of 128
+voxels: 0.9 to 1.0 ms at the default `probe_spacing` of 4, 1.7 to 2.1 ms at 2.
+Other hardware has not been measured. The cost does not depend on the number
+of lights or emissive surfaces. With `RenderDiagnosticsPlugin`, each stage
+reports its own GPU time (`rc_pyramids`, `rc_voxels`, `rc_cascade_NN`,
+`rc_gather`, `rc_resolve`).
 
 ## Requirements and limitations
 
