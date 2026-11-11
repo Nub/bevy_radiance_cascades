@@ -1,0 +1,30 @@
+[package]
+name = "bevy_radiance_cascades"
+version = "0.1.0"
+edition = "2024"
+description = "Noise-free screen-space radiance cascades global illumination for Bevy 0.20"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["bevy", "gi", "radiance-cascades", "rendering", "lighting"]
+categories = ["game-development", "rendering"]
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false, features = [
+    "bevy_render",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_log",
+] }
+
+# The example needs a windowed app; keep that out of the library.
+[dev-dependencies]
+bevy = { version = "0.20.1" }
+
+[[example]]
+name = "room"
+path = "examples/room.rs"
+
+# Shader iteration is the slow part, not rustc: keep deps optimized so the
+# example runs at a sane frame rate in dev builds.
+[profile.dev.package."*"]
+opt-level = 3
