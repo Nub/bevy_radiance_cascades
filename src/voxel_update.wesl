@@ -124,9 +124,28 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         info = textureLoad(voxel_meta, texel).r;
         radiance = rgb9e5_to_vec3_(textureLoad(voxel_radiance, texel).r);
     } else if marked == 0u {
-        // Scrolled in, and nothing shows in it.
-        textureStore(voxel_meta, texel, vec4<u32>(0u));
-        textureStore(voxel_radiance, texel, vec4<u32>(0u));
+        // Scrolled in, and nothing shows in it. What the level above
+        // remembers of the place is all that is known of it: it takes that,
+        // coarse as it is, until it is seen. Left empty instead, it hid it:
+        // rays ask the finest level that covers a place, so as the camera
+        // came nearer a floor it had seen from across the room, the floor was
+        // forgotten, and the ceiling it lights went dark.
+        var kept_info = 0u;
+        var kept_radiance = 0u;
+        if level + 1u < voxels.levels {
+            let above = index >> vec3<u32>(1u);
+            let rel = above - voxels.origin[level + 1u].xyz;
+            if all(rel >= vec3<i32>(0)) && all(rel < vec3<i32>(n)) {
+                let source = voxel_texel(above, level + 1u, voxels.resolution);
+                let its = textureLoad(voxel_meta, source).r;
+                if voxel_occupied(its) {
+                    kept_info = its;
+                    kept_radiance = textureLoad(voxel_radiance, source).r;
+                }
+            }
+        }
+        textureStore(voxel_meta, texel, vec4<u32>(kept_info));
+        textureStore(voxel_radiance, texel, vec4<u32>(kept_radiance, 0u, 0u, 0u));
         return;
     }
     if marked == 0u && info == 0u {
