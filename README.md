@@ -45,6 +45,12 @@ commands.spawn((Camera3d::default(), Msaa::Off, RadianceCascades::default()));
 `cargo run --example room` shows a closed room lit by one spot light and one
 glowing bar. `Space` toggles the cascades, `D` cycles the debug views.
 
+`cargo run --example cornell` is a Cornell box lit only by a glowing panel,
+and with `RC_MODE=reference` the same box path traced (Bevy Solari's reference
+path tracer). `python cornell.py <name> [RC_...=value]` renders both and prints
+how bright the cascades are against the path tracer, region by region; with
+`RC_BOUNCE=0`, against the panel's direct light worked out exactly.
+
 ## How it works
 
 Every frame, after the opaque pass:
@@ -86,7 +92,7 @@ All on the `RadianceCascades` component; see its docs for detail.
 | --- | --- | --- |
 | `probe_spacing` | 4 | Pixels between the finest probes. Cost per cascade is `(base_resolution / probe_spacing)^2` rays per pixel. |
 | `base_resolution` | 4 | Directions across the finest probes' maps (16 directions). |
-| `cascade_count` | 6 | The last cascade always reaches to the edge of the screen. |
+| `cascade_count` | 4 | The last cascade always reaches to the edge of the screen. More resolve far light into finer directions, but from probes twice as far apart each: past four, measured against a path tracer, they lose light and smear shadows. |
 | `interval_length` | 2 | Length of the finest rays in probe spacings. Longer is steadier under camera motion. |
 | `thickness` | 0.5 | How thick, in world units, on-screen surfaces are assumed to be. |
 | `bounce` | 1 | 1 for physically correct multiple bounces, 0 for one. |
@@ -94,7 +100,9 @@ All on the `RadianceCascades` component; see its docs for detail.
 | `ambient_occlusion` | 1 | How much of the camera's `ScreenSpaceAmbientOcclusion`, if it has one, darkens the indirect light in creases and contacts the probes are too coarse for. |
 | `specular` | 1 | How much of the arriving light a surface's specular side reflects to the eye. Metals have no diffuse side: without it the bounced light does not show on them. |
 | `specular_roughness` | 0.3..0.6 | The perceptual roughness over which `specular` fades in. Smoother surfaces are left to screen-space reflections. |
+| `specular_separate` | false | Keep what each pixel mirrors out of the image, in `RadianceCascadesResources::specular`, for a reflection pass of your own to combine with. If that pass runs before the cascades (screen-space reflections do), don't hand it the texture, which is last frame's by then: put a `RadianceCascadesSpecularCover` on the view in the render world, a texture whose alpha says how much of each pixel's reflection the pass found, and the cascades add the rest themselves. |
 | `emissive_scale`, `emissive_unexposed` | 1, off | For a Bevy fork that stores the G-buffer's emissive scaled or without the exposure applied. |
+| `ambient` | 0 | A uniform light arriving at every surface, in lux, bounced like any other: an ambient fill. |
 | `amortize_far` | on | Traces the far cascades every second or fourth frame instead of every one. Far light is a few frames late; the cost falls by about a third. |
 | `sky_color`, `sky_brightness` | white, 80 | What rays that escape everything see. Set the brightness to 0 indoors. |
 | `world_cache` | on | `None` for purely screen-space lighting. |
@@ -114,8 +122,9 @@ commands.spawn((
     RadianceEmitter {
         radiance: LinearRgba::rgb(40_000.0, 40_000.0, 36_000.0), // cd/m^2
         area: 0.36,
-        normal: Dir3::NEG_Y,
+        normal: Some(Dir3::NEG_Y),
         range: 30.0,
+        clearance: 0.3,
         // The room it hangs in, relative to it: its light stays inside.
         bounds: Some((Vec3::new(-4.0, -3.0, -4.0), Vec3::new(4.0, 0.5, 4.0))),
     },
@@ -156,5 +165,13 @@ reports its own GPU time (`rc_pyramids`, `rc_voxels`, `rc_cascade_NN`,
 * Perspective projections only, and the camera's viewport must start at the
   origin of its render target.
 * Exposure changes are handled, but the cache is not shared between cameras.
+* **It is darker than a path tracer.** In the `cornell` example at the
+  defaults, the light a glowing panel sends straight to the surfaces in view
+  comes to 0.96 of the exact figure (13% mean error); with all its bounces the
+  image is 0.80 as bright as the path-traced one. Light bounced from what is
+  off screen, which only the world cache knows, is weaker still: a ceiling lit
+  by a floor out of view gets about a third of what it should. A
+  `RadianceEmitter` on its own delivers about 0.73 of an emissive surface of
+  its luminance and area.
 * Work in progress: stability under camera motion and the cost of the gather
   are being worked on.

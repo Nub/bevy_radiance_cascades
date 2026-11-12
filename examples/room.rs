@@ -158,7 +158,7 @@ fn setup(
             sky_brightness: 0.0,
             world_cache: (std::env::var("RC_WORLD").as_deref() != Ok("0")).then(default),
             // Overrides for experiments.
-            cascade_count: env_or("RC_CASCADES", 6.0) as u32,
+            cascade_count: env_or("RC_CASCADES", 4.0) as u32,
             probe_spacing: env_or("RC_SPACING", 4.0) as u32,
             base_resolution: env_or("RC_RES", 4.0) as u32,
             interval_length: env_or("RC_INTERVAL", 2.0),
@@ -200,7 +200,7 @@ fn controls(
                 RadianceCascadesDebug::Indirect => RadianceCascadesDebug::Irradiance,
                 RadianceCascadesDebug::Irradiance => RadianceCascadesDebug::Surfaces,
                 RadianceCascadesDebug::Surfaces => RadianceCascadesDebug::WorldCache,
-                RadianceCascadesDebug::WorldCache => RadianceCascadesDebug::Off,
+                _ => RadianceCascadesDebug::Off,
             };
         }
     }

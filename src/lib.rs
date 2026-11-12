@@ -60,7 +60,7 @@ use bevy::{
     shader::load_shader_library,
 };
 
-pub use prepare::RadianceCascadesResources;
+pub use prepare::{RadianceCascadesResources, RadianceCascadesSpecularCover};
 
 /// Most cascades a view can have. Six to eight cover any sensible resolution:
 /// each starts twice as far from its probe as the one before, and once that is
@@ -139,6 +139,12 @@ pub enum RadianceCascadesDebug {
     Surfaces,
     /// The contents of the world cache, as if it were the scene.
     WorldCache,
+    /// How much of the light arriving at each surface it sends on to the eye,
+    /// its diffuse and its specular side together.
+    Reflectance,
+    /// What the G-buffer says of each surface: red its roughness, green how
+    /// metallic it is, blue its baked occlusion.
+    Materials,
 }
 
 impl RadianceCascadesDebug {
@@ -228,8 +234,21 @@ pub struct RadianceCascades {
     /// exposure applied. Bevy stores it as the material has it, which the
     /// deferred lighting takes as exposed: false.
     pub emissive_unexposed: bool,
-    /// Trace the far cascades less often than every frame: the fourth and
-    /// fifth every other frame, turn about, and those above every fourth. Far
+    /// Leave what surfaces mirror ([`Self::specular`]) out of the image, and
+    /// write it to [`RadianceCascadesResources::specular`] instead, for every
+    /// roughness: for a reflection pass that adds it where its own rays find
+    /// nothing, in place of an environment map. Added here as well, a mirror
+    /// of what is on screen would show both.
+    pub specular_separate: bool,
+    /// A uniform light arriving at every surface the cascades light, in lux:
+    /// an ambient fill. It is bounced like any other light, so a closed room
+    /// ends up with more than this by what its surfaces reflect. 0 for none:
+    /// the cascades are the ambient light, and a fill on top is a look, as it
+    /// is in a path tracer that adds one.
+    pub ambient: f32,
+    /// Trace the far cascades less often than every frame while the camera is
+    /// still: the fourth and fifth every other frame, turn about, and those
+    /// above every fourth (every one of them every frame while it moves). Far
     /// light changes little from one frame to the next at any one place on
     /// screen, and these cascades are most of the cost, as their rays are the
     /// ones that leave the screen for the world cache. A light that changes
@@ -323,7 +342,7 @@ impl Default for RadianceCascades {
         Self {
             probe_spacing: 4,
             base_resolution: 4,
-            cascade_count: 6,
+            cascade_count: 4,
             interval_length: 2.0,
             max_steps: 64,
             thickness: 0.5,
@@ -337,6 +356,8 @@ impl Default for RadianceCascades {
             specular_roughness: 0.3..0.6,
             emissive_scale: 1.0,
             emissive_unexposed: false,
+            specular_separate: false,
+            ambient: 0.0,
             amortize_far: true,
             sky_color: LinearRgba::WHITE,
             sky_brightness: 80.0,

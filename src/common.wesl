@@ -55,6 +55,15 @@ struct RcParams {
     /// the lit scene, and whether the exposure is still to be applied to it.
     emissive_scale: f32,
     emissive_unexposed: u32,
+    /// Whether what surfaces mirror goes to `specular_out` for a reflection
+    /// pass to add (and not into the image here).
+    specular_separate: u32,
+    /// The cascade `specular_in` is, and its probes and size.
+    spec_level: u32,
+    spec_probe_count: vec2<u32>,
+    spec_texture_size: vec2<u32>,
+    /// A uniform light arriving at every surface (lux, before the exposure).
+    ambient: f32,
 }
 
 @group(0) @binding(0) var<uniform> params: RcParams;
@@ -92,11 +101,13 @@ struct Emitter {
     position: vec3<f32>,
     /// How far its light reaches.
     range: f32,
-    /// The side it shines from.
+    /// The side it shines from (zero: all round).
     normal: vec3<f32>,
     area: f32,
     /// Its luminance, before the exposure.
     radiance: vec3<f32>,
+    /// How near it things are not in its way.
+    clearance: f32,
     /// The box its light stays in.
     bounds_min: vec3<f32>,
     bounds_max: vec3<f32>,
@@ -108,6 +119,19 @@ struct Emitters {
 }
 
 @group(0) @binding(21) var<uniform> emitters: Emitters;
+/// What each pixel mirrors of the cascades' light, weighed by how much its
+/// surface reflects: written by `resolve` (see `RadianceCascades::specular_separate`).
+@group(0) @binding(22) var specular_out: texture_storage_2d<rgba16float, write>;
+/// A cascade with finer directions than the first, merged, for `resolve` to
+/// read what surfaces mirror from.
+@group(0) @binding(23) var specular_in: texture_2d<f32>;
+/// What each pixel mirrored last frame (`specular_out` then), for `resolve` to
+/// steady this frame's with, and for the cascades to bounce.
+@group(0) @binding(24) var specular_history: texture_2d<f32>;
+/// The emitters' highlights on each pixel (see `highlights` in `gather.wesl`):
+/// added to the image with the indirect light, and kept apart from it so
+/// that they are not bounced on as if the surface sent them every way.
+@group(0) @binding(25) var highlight_out: texture_storage_2d<rgba16float, write>;
 
 const PI: f32 = 3.14159265358979;
 /// What a ray finds: rgb = radiance arriving from its interval, a =
@@ -122,6 +146,10 @@ const DEBUG_IRRADIANCE: u32 = 2u;
 const DEBUG_SURFACES: u32 = 3u;
 /// `RadianceCascadesDebug::WorldCache`.
 const DEBUG_WORLD_CACHE: u32 = 4u;
+/// `RadianceCascadesDebug::Reflectance`.
+const DEBUG_REFLECTANCE: u32 = 5u;
+/// `RadianceCascadesDebug::Materials`.
+const DEBUG_MATERIALS: u32 = 6u;
 
 /// Equal-area octahedral map (Clarberg), texel centre -> unit direction.
 fn oct_dir(texel: vec2<u32>, res: u32) -> vec3<f32> {
@@ -243,31 +271,50 @@ fn gbuffer_diffuse_color(g: vec4<u32>) -> vec3<f32> {
     return base_color * (1.0 - props.g) * props.b;
 }
 
-/// How much of the light arriving at a surface leaves it towards the eye: its
-/// diffuse albedo and, where it is rough enough, what its specular side
-/// reflects of it. A metal has no diffuse side at all: without the second
-/// part the bounced light falls on it and is never seen. (The arriving light
-/// stands in for the light from around the mirrored direction, which is fair
-/// for a rough surface, whose reflection is broad; a smooth one is left to
-/// what draws sharp reflections.)
-fn gbuffer_reflectance(g: vec4<u32>, normal: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+/// How rough a surface is, perceptually (0 a mirror, 1 matte).
+fn gbuffer_roughness(g: vec4<u32>) -> f32 {
+    return unpack4x8unorm(g.r).a;
+}
+
+/// How much of the light a surface mirrors towards the eye it reflects, by
+/// colour: none of it where `specular` is off. A metal has no diffuse side at
+/// all: without this the bounced light falls on it and is never seen.
+fn gbuffer_specular_color(g: vec4<u32>, normal: vec3<f32>, to_eye: vec3<f32>) -> vec3<f32> {
+    if params.specular <= 0.0 {
+        return vec3<f32>(0.0);
+    }
     let base = unpack4x8unorm(g.r);
     let base_color = pow(base.rgb, vec3<f32>(2.2));
     let props = unpack4x8unorm(g.b);
-    let diffuse = base_color * (1.0 - props.g) * props.b;
-    if params.specular <= 0.0 {
-        return diffuse;
-    }
     let roughness = base.a;
-    let share = params.specular
-        * smoothstep(params.specular_roughness.x, max(params.specular_roughness.y, params.specular_roughness.x + 1e-3), roughness);
     let f0 = mix(vec3<f32>(0.16 * props.r * props.r), base_color, props.g);
     // The split-sum environment term, as fitted by Karis for mobile.
     let n_dot_v = saturate(dot(normal, to_eye));
     let r = roughness * vec4<f32>(-1.0, -0.0275, -0.572, 0.022) + vec4<f32>(1.0, 0.0425, 1.04, -0.04);
     let a004 = min(r.x * r.x, exp2(-9.28 * n_dot_v)) * r.x + r.y;
     let ab = vec2<f32>(-1.04, 1.04) * a004 + r.zw;
-    return diffuse + (f0 * ab.x + ab.y) * props.b * share;
+    // And what scatters more than once between the facets of a rough surface
+    // before it leaves (Fdez-Aguera), which the term above leaves out: on a
+    // rough metal that is half of what it reflects.
+    let single = f0 * ab.x + ab.y;
+    let lost = 1.0 - (ab.x + ab.y);
+    let average = f0 + (1.0 - f0) / 21.0;
+    let multiple = single * average / (1.0 - lost * average) * lost;
+    return (single + multiple) * props.b * params.specular;
+}
+
+/// What a surface reflects at normal incidence, by colour.
+fn gbuffer_f0(g: vec4<u32>) -> vec3<f32> {
+    let base_color = pow(unpack4x8unorm(g.r).rgb, vec3<f32>(2.2));
+    let props = unpack4x8unorm(g.b);
+    return mix(vec3<f32>(0.16 * props.r * props.r), base_color, props.g);
+}
+
+/// How much of what a surface mirrors is added to the image here, by its
+/// roughness, where it is not left to a reflection pass altogether: the smooth
+/// are left to screen-space reflections.
+fn specular_share(roughness: f32) -> f32 {
+    return smoothstep(params.specular_roughness.x, max(params.specular_roughness.y, params.specular_roughness.x + 1e-3), roughness);
 }
 
 /// What glows at a pixel, in the units of the lit scene.

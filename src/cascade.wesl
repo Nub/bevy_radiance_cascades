@@ -3,7 +3,7 @@
 //! Dispatched from the top cascade down.
 
 import package::common::{
-    params, view, emitters, oct_texel, PI, depth_tex, gbuffer_tex, scene_color, history, cascade_in, linear_sampler, output,
+    params, view, emitters, oct_texel, PI, specular_history, depth_tex, gbuffer_tex, scene_color, history, cascade_in, linear_sampler, output,
     depth_pyramid, color_pyramid, voxels, trace_voxels, MISS,
     oct_dir, view_size_f, linear_depth, pixel_footprint, ndc_to_pixel, world_position,
     gbuffer_normal, gbuffer_valid, gbuffer_emissive, surface_normal, probe_pixel, probe_weights, probe_index, MAX_RADIANCE,
@@ -68,7 +68,13 @@ fn bounced_radiance(pix: vec2<i32>, depth: f32) -> vec3<f32> {
     if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) {
         return vec3<f32>(0.0);
     }
-    return params.bounce * voxels.history_scale * textureSampleLevel(history, linear_sampler, uv, 0.0).rgb;
+    // (And what it mirrored towards the eye, where that is kept apart: taken
+    // for what it sends every way, which is all a metal bounces.)
+    var left = textureSampleLevel(history, linear_sampler, uv, 0.0).rgb;
+    if params.specular_separate != 0u {
+        left += textureSampleLevel(specular_history, linear_sampler, uv, 0.0).rgb;
+    }
+    return params.bounce * voxels.history_scale * left;
 }
 
 /// What the ray finds at the pixel where it meets the depth buffer.
@@ -234,21 +240,68 @@ fn merge_upper(pixel: vec2<f32>, position: vec3<f32>, normal: vec3<f32>, footpri
     // less a probe on the wrong surface is wrong, and the more a seam shows.
     let min_weight = min(0.02 * f32(1u << params.cascade_index), 0.5);
     let weights = probe_weights(pixel, position, normal, footprint, upper_spacing, params.upper_probe_count, min_weight);
+    // (With how much of each the probes there know, in the alpha: see
+    // `HORIZON`.)
+    var radiance = vec4<f32>(0.0);
+    if params.cascade_index == 0u {
+        // The first cascade is what the gather integrates over each surface's
+        // hemisphere, and its directions are few: one covers a sixteenth of
+        // the sphere, across which the cosine of the angle to the normal goes
+        // from 1 to half that. So its four finer directions are each weighed
+        // by their own cosine here, and the gather weighs the whole by their
+        // sum: a lamp straight overhead then counts in full, where the plain
+        // mean had it at the mean cosine of the direction it fell in, and
+        // what is below the horizon of a direction that straddles it does not
+        // count at all.
+        var cosines: array<f32, 4>;
+        var total = 0.0;
+        for (var k = 0u; k < 4u; k++) {
+            let child = dir_texel * 2u + vec2<u32>(k & 1u, k >> 1u);
+            cosines[k] = max(dot(normal, oct_dir(child, upper_res)), 0.0);
+            total += cosines[k];
+        }
+        if total > 1e-4 {
+            for (var j = 0u; j < 4u; j++) {
+                let probe = probe_index(weights.base, j, params.upper_probe_count) * i32(upper_res);
+                for (var k = 0u; k < 4u; k++) {
+                    let child = vec2<i32>(dir_texel * 2u + vec2<u32>(k & 1u, k >> 1u));
+                    radiance += (weights.w[j] * cosines[k] / total) * textureLoad(cascade_in, probe + child, 0);
+                }
+            }
+            return known(radiance);
+        }
+    }
     // The shared corner of the 2x2 child texels: one bilinear tap averages them.
     let texel = vec2<f32>(dir_texel * 2u + 1u);
-    var radiance = vec3<f32>(0.0);
     for (var j = 0u; j < 4u; j++) {
         let probe = probe_index(weights.base, j, params.upper_probe_count);
         let uv = (vec2<f32>(probe * i32(upper_res)) + texel) / vec2<f32>(params.upper_texture_size);
-        radiance += weights.w[j] * textureSampleLevel(cascade_in, linear_sampler, uv, 0.0).rgb;
+        radiance += weights.w[j] * textureSampleLevel(cascade_in, linear_sampler, uv, 0.0);
     }
-    return radiance;
+    return known(radiance);
 }
 
-/// How far short of an emitter the rays that look for what stands before it
-/// stop, in world units: what holds it (its housing, the ceiling it hangs
-/// from) is not in its way.
-const EMITTER_CLEARANCE: f32 = 0.3;
+/// A probe above the first cascade knows nothing of the directions that lead
+/// into the surface it stands on (this far below its horizon, as the cosine
+/// of the angle to its normal): its ray would start inside the wall. It
+/// leaves them empty, alpha and all, and whoever merges with it goes by the
+/// probes around it that do know. Counted as dark instead, they were: the
+/// probes of the far cascades are far apart, and of those around a small
+/// thing half stand on the wall behind it, which had a box top lit from
+/// straight above by half of what reached it.
+const HORIZON: f32 = -0.1;
+
+/// The mean of what is known of a sum of radiances that are empty where they
+/// are not (see `HORIZON`).
+fn known(sum: vec4<f32>) -> vec3<f32> {
+    if sum.a < 1e-3 {
+        // Nothing is: a small thing against the sky, say, with every probe
+        // around it on the background.
+        return params.sky_radiance * view.exposure;
+    }
+    return sum.rgb / sum.a;
+}
+
 /// An emitter lights a surface if the point this far off it, in world units,
 /// is in the emitter's box, and nothing by this far out of it. The walls of
 /// its room stand on the box, or a little outside it, and their faces look
@@ -297,6 +350,10 @@ fn emitted(
         if out >= EMITTER_BOUNDS_NONE {
             continue;
         }
+        // (A fill light, which nothing shadows, is the gather's: `fill_light`.)
+        if emitter.clearance >= emitter.range {
+            continue;
+        }
         let to = emitter.position - position;
         let distance = length(to);
         if distance >= emitter.range || distance < 1e-4 {
@@ -315,7 +372,10 @@ fn emitted(
             continue;
         }
         let towards = to / distance;
-        let facing = dot(emitter.normal, -towards);
+        var facing = 1.0;
+        if any(emitter.normal != vec3<f32>(0.0)) {
+            facing = dot(emitter.normal, -towards);
+        }
         // (Nor does it light a surface from behind.)
         if facing <= 0.0 || dot(normal, towards) <= 0.0 {
             continue;
@@ -327,7 +387,8 @@ fn emitted(
         }
         // Whether anything stands before it along this ray: on screen, or
         // where the screen cannot say, in the world cache.
-        let reach = distance - max(EMITTER_CLEARANCE, voxels.voxel_size * 1.5);
+        // (Short of it by its clearance, and of the voxels it is in.)
+        let reach = distance - max(emitter.clearance, voxels.voxel_size * 1.5);
         var sight = 1.0;
         if screen.result.a < 1.0 && screen.distance < reach {
             sight = 0.0;
@@ -364,8 +425,9 @@ fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
     let pix = probe_pixel(probe, params.probe_spacing);
     let depth = textureLoad(depth_tex, pix, 0);
     if depth <= 0.0 {
-        // Probe sits on the background: nothing can occlude it on screen.
-        textureStore(output, id.xy, vec4<f32>(sky, 1.0));
+        // Probe sits on the background: it stands nowhere, and knows nothing
+        // of what arrives at the surfaces beside it on screen (see `HORIZON`).
+        textureStore(output, id.xy, vec4<f32>(0.0));
         return;
     }
 
@@ -375,6 +437,10 @@ fn cascade(@builtin(global_invocation_id) id: vec3<u32>) {
     let footprint = pixel_footprint(linear_depth(depth));
 
     var ray_dir = dir;
+    if params.cascade_index > 0u && dot(normal, dir) < HORIZON {
+        textureStore(output, id.xy, vec4<f32>(0.0));
+        return;
+    }
     if params.cascade_index == 0u {
         // The first interval starts on the surface, so directions into it see
         // nothing. A texel that straddles the horizon stands for the part of

@@ -92,6 +92,10 @@ pub fn init_radiance_cascades_pipelines(
                 texture_2d(TextureSampleType::Float { filterable: true }),
                 texture_storage_2d(CASCADE_FORMAT, StorageTextureAccess::WriteOnly),
                 uniform_buffer::<crate::emitters::EmitterUniform>(false),
+                texture_storage_2d(CASCADE_FORMAT, StorageTextureAccess::WriteOnly),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_storage_2d(CASCADE_FORMAT, StorageTextureAccess::WriteOnly),
             ),
         ),
     );
@@ -147,9 +151,14 @@ pub fn init_radiance_cascades_pipelines(
 
     let composite_layout = BindGroupLayoutDescriptor::new(
         "radiance_cascades_composite_bind_group_layout",
-        &BindGroupLayoutEntries::single(
+        &BindGroupLayoutEntries::sequential(
             ShaderStages::FRAGMENT,
-            texture_2d(TextureSampleType::Float { filterable: true }),
+            (
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+                texture_2d(TextureSampleType::Float { filterable: true }),
+            ),
         ),
     );
 
@@ -315,6 +324,7 @@ pub fn radiance_cascades(
         &ViewDepthStencilTexture,
         &ViewUniformOffset,
         Option<&ScreenSpaceAmbientOcclusionResources>,
+        Option<&crate::prepare::RadianceCascadesSpecularCover>,
     )>,
     pipelines: Option<Res<RadianceCascadesPipelines>>,
     pipeline_cache: Res<PipelineCache>,
@@ -323,8 +333,15 @@ pub fn radiance_cascades(
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
-    let (resources, view_target, prepass_textures, view_depth, view_uniform_offset, occlusion) =
-        view.into_inner();
+    let (
+        resources,
+        view_target,
+        prepass_textures,
+        view_depth,
+        view_uniform_offset,
+        occlusion,
+        specular_cover,
+    ) = view.into_inner();
 
     let Some(pipelines) = pipelines else {
         return;
@@ -436,6 +453,13 @@ pub fn radiance_cascades(
                     resources.previous_recent(),
                     resources.recent(),
                     emitters.clone(),
+                    // What was mirrored last frame, to bounce again (the
+                    // resolve writes this frame's, into a binding the
+                    // cascades leave alone).
+                    &resources.raw_irradiance,
+                    history,
+                    resources.previous_specular(),
+                    &resources.highlight,
                 )),
             )
         })
@@ -481,6 +505,10 @@ pub fn radiance_cascades(
                 read_recent,
                 write_recent,
                 emitters.clone(),
+                resources.specular(),
+                &cascades[resources.specular_level].view,
+                resources.previous_specular(),
+                &resources.highlight,
             )),
         )
     };
@@ -571,12 +599,18 @@ pub fn radiance_cascades(
     let composite_bind_group = render_device.create_bind_group(
         "radiance_cascades_composite_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.composite_layout),
-        &BindGroupEntries::single(
+        &BindGroupEntries::sequential((
             resources
                 .debug_view
                 .as_ref()
                 .unwrap_or(resources.indirect()),
-        ),
+            &resources.highlight,
+            resources.specular(),
+            // (Not in the debug views, nor without one: see `composite.wesl`.)
+            specular_cover
+                .filter(|_| resources.debug_view.is_none())
+                .map_or(resources.specular(), |cover| &cover.0),
+        )),
     );
 
     let diagnostics = ctx.diagnostic_recorder();

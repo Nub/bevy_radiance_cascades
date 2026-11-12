@@ -42,8 +42,10 @@ pub struct RadianceEmitter {
     pub radiance: LinearRgba,
     /// Its area in world units squared.
     pub area: f32,
-    /// The side it shines from, in the entity's own space.
-    pub normal: Dir3,
+    /// The side it shines from, in the entity's own space; `None` for
+    /// something that shines all round (a bulb, a glowing ball), whose `area`
+    /// is then what it shows of itself from any side.
+    pub normal: Option<Dir3>,
     /// How far its light reaches, in world units, fading out over the last
     /// quarter. What stands between it and a surface is only known where the
     /// camera has seen it: the shorter this is, the less can leak.
@@ -54,6 +56,16 @@ pub struct RadianceEmitter {
     /// it, and a lamp otherwise lights the next room through a wall nobody
     /// has looked at yet. `None` lets it light whatever is in range.
     pub bounds: Option<(Vec3, Vec3)>,
+    /// How near it things are not in its way, in world units: what holds it
+    /// (its housing, the ceiling it hangs from), and whatever else stands so
+    /// close that the few rays that look for it would make a room-wide shadow
+    /// of it.
+    ///
+    /// As much as its `range` or more, nothing at all is in its way: it is a
+    /// fill light, cast on every surface in its `bounds` that faces it, with
+    /// no shadows (and at no cost in rays). That is the light to stand for
+    /// one that reaches round things, as a lamp's spill through its shade.
+    pub clearance: f32,
 }
 
 impl Default for RadianceEmitter {
@@ -61,9 +73,10 @@ impl Default for RadianceEmitter {
         Self {
             radiance: LinearRgba::WHITE,
             area: 1.0,
-            normal: Dir3::NEG_Y,
+            normal: Some(Dir3::NEG_Y),
             range: 30.0,
             bounds: None,
+            clearance: 0.3,
         }
     }
 }
@@ -77,6 +90,7 @@ pub struct ExtractedEmitter {
     area: f32,
     range: f32,
     bounds: (Vec3, Vec3),
+    clearance: f32,
 }
 
 #[derive(Resource, Default)]
@@ -90,6 +104,7 @@ struct EmitterData {
     normal: Vec3,
     area: f32,
     radiance: Vec3,
+    clearance: f32,
     bounds_min: Vec3,
     bounds_max: Vec3,
 }
@@ -122,7 +137,9 @@ pub fn extract_emitters(
         .filter(|(emitter, _, visible)| visible.get() && emitter.area > 0.0 && emitter.range > 0.0)
         .map(|(emitter, transform, _)| ExtractedEmitter {
             position: transform.translation(),
-            normal: (transform.rotation() * *emitter.normal).normalize_or_zero(),
+            normal: emitter.normal.map_or(Vec3::ZERO, |n| {
+                (transform.rotation() * *n).normalize_or_zero()
+            }),
             radiance: Vec3::new(
                 emitter.radiance.red,
                 emitter.radiance.green,
@@ -131,6 +148,7 @@ pub fn extract_emitters(
             .max(Vec3::ZERO),
             area: emitter.area,
             range: emitter.range,
+            clearance: emitter.clearance.max(0.0),
             bounds: emitter.bounds.map_or(
                 (Vec3::splat(-1.0e30), Vec3::splat(1.0e30)),
                 |(low, high)| {
@@ -168,6 +186,7 @@ pub fn prepare_emitters(
                 normal: e.normal,
                 area: e.area,
                 radiance: e.radiance,
+                clearance: e.clearance,
                 bounds_min: e.bounds.0,
                 bounds_max: e.bounds.1,
             };

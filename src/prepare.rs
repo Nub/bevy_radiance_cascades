@@ -61,6 +61,11 @@ pub struct CascadeUniform {
     specular_roughness: Vec2,
     emissive_scale: f32,
     emissive_unexposed: u32,
+    specular_separate: u32,
+    spec_level: u32,
+    spec_probe_count: UVec2,
+    spec_texture_size: UVec2,
+    ambient: f32,
 }
 
 pub const VOXEL_FORMAT: TextureFormat = TextureFormat::R32Uint;
@@ -178,6 +183,12 @@ impl Layout {
         self.base_resolution << cascade
     }
 
+    /// The cascade the resolve reads what surfaces mirror from: finer in
+    /// direction than the first, and still close to the surface.
+    pub(crate) fn specular_level(&self) -> u32 {
+        2.min(self.cascade_count - 1)
+    }
+
     fn probe_count(&self, cascade: u32) -> UVec2 {
         let spacing = self.probe_spacing(cascade);
         UVec2::new(
@@ -211,6 +222,17 @@ pub struct CascadeLevel {
 }
 
 /// Per-view GPU resources of [`RadianceCascades`].
+/// How much of what each pixel mirrors is in the image already, in the alpha
+/// of a texture the size of the view (0 none of it, 1 all): put on a view in
+/// the render world, each frame and before the cascades run, by whatever draws
+/// reflections of its own (screen-space ones, say, with how much of each
+/// pixel's their rays found). The cascades then add the rest of
+/// [`RadianceCascadesResources::specular`] to the image themselves, from this
+/// frame's light, which a pass that runs before them cannot have. Needs
+/// [`RadianceCascades::specular_separate`](crate::RadianceCascades::specular_separate).
+#[derive(Component, Clone)]
+pub struct RadianceCascadesSpecularCover(pub TextureView);
+
 #[derive(Component)]
 pub struct RadianceCascadesResources {
     layout: Layout,
@@ -224,6 +246,13 @@ pub struct RadianceCascadesResources {
     /// The same over only the last few frames (see `accumulate` in
     /// `gather.wesl`): this frame's and last frame's.
     recent: [TextureView; 2],
+    /// What each pixel mirrors of the cascades' light (see
+    /// `RadianceCascades::specular_separate`): this frame's and last frame's.
+    specular: [TextureView; 2],
+    /// The cascade the resolve reads that from.
+    pub(crate) specular_level: usize,
+    /// The emitters' highlights on each pixel, for the composite.
+    pub(crate) highlight: TextureView,
     /// Which of `indirect`, `irradiance` and `recent` is written this frame.
     current: usize,
     /// Frames since these were made.
@@ -232,6 +261,8 @@ pub struct RadianceCascadesResources {
     /// (see `RadianceCascades::amortize_far`).
     pub(crate) kept_cascades: u32,
     clip_from_world: Mat4,
+    /// Where the camera was last frame (to tell whether it has moved).
+    world_from_view: Mat4,
     /// Copy of the depth buffer as the opaque pass left it. (The depth
     /// prepass's own copy lacks everything that is drawn without a prepass.)
     pub(crate) depth: Texture,
@@ -269,6 +300,20 @@ impl RadianceCascadesResources {
 
     pub(crate) fn previous_irradiance(&self) -> &TextureView {
         &self.irradiance[1 - self.current]
+    }
+
+    /// What each pixel mirrors of the cascades' light, weighed by how much its
+    /// surface reflects, in the units of the lit scene and at the size of the
+    /// view: for a reflection pass to add where its own rays find nothing.
+    /// With [`RadianceCascades::specular_separate`] it is in the image only if
+    /// such a pass puts it there; without, the rough surfaces' share of it
+    /// already is, and adding it again shows that twice.
+    pub fn specular(&self) -> &TextureView {
+        &self.specular[self.current]
+    }
+
+    pub(crate) fn previous_specular(&self) -> &TextureView {
+        &self.specular[1 - self.current]
     }
 
     pub(crate) fn recent(&self) -> &TextureView {
@@ -335,7 +380,21 @@ pub fn prepare_radiance_cascades_resources(
                 resources.current = 1 - resources.current;
                 resources.replace_scene = replace_scene;
                 resources.frame = resources.frame.wrapping_add(1);
-                resources.kept_cascades = kept_cascades(settings, resources.frame);
+                // (Not while the camera moves: what a cascade traced a frame or
+                // three ago it traced from where its probes were on screen then,
+                // which is other places now, and kept, that light jumps about
+                // with every frame of a turn.)
+                let world_from_view = view.world_from_view.to_matrix();
+                let moved = (world_from_view - resources.world_from_view)
+                    .to_cols_array()
+                    .iter()
+                    .any(|d| d.abs() > 1e-4);
+                resources.world_from_view = world_from_view;
+                resources.kept_cascades = if moved {
+                    0
+                } else {
+                    kept_cascades(settings, resources.frame)
+                };
                 if !settings.debug.is_lighting() && resources.debug_view.is_none() {
                     resources.debug_view = Some(create_view_texture(
                         &render_device,
@@ -471,6 +530,12 @@ fn create_resources(
         create_texture("radiance_cascades_recent_a", layout.view_size),
         create_texture("radiance_cascades_recent_b", layout.view_size),
     ];
+    let specular = [
+        create_texture("radiance_cascades_specular_a", layout.view_size),
+        create_texture("radiance_cascades_specular_b", layout.view_size),
+    ];
+    let specular_level = layout.specular_level() as usize;
+    let highlight = create_texture("radiance_cascades_highlight", layout.view_size);
 
     let depth = render_device.create_texture(&TextureDescriptor {
         label: Some("radiance_cascades_depth"),
@@ -623,6 +688,9 @@ fn create_resources(
         raw_irradiance,
         irradiance,
         recent,
+        specular,
+        specular_level,
+        highlight,
         depth,
         depth_view,
         pyramid,
@@ -634,6 +702,7 @@ fn create_resources(
         frame: 0,
         kept_cascades: 0,
         clip_from_world,
+        world_from_view: Mat4::IDENTITY,
         view_size: layout.view_size,
         debug_view: None,
         replace_scene,
@@ -789,6 +858,11 @@ fn write_uniforms(
             ),
             emissive_scale: settings.emissive_scale.max(0.0),
             emissive_unexposed: settings.emissive_unexposed as u32,
+            specular_separate: settings.specular_separate as u32,
+            spec_level: layout.specular_level(),
+            spec_probe_count: layout.probe_count(layout.specular_level()),
+            spec_texture_size: layout.texture_size(layout.specular_level()),
+            ambient: settings.ambient.max(0.0),
         };
 
         let mut buffer = encase::UniformBuffer::new(Vec::new());

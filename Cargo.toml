@@ -18,11 +18,16 @@ bevy = { version = "0.20.1", default-features = false, features = [
 
 # The example needs a windowed app; keep that out of the library.
 [dev-dependencies]
-bevy = { version = "0.20.1" }
+# (`bevy_solari`: the path-traced reference of the `cornell` example.)
+bevy = { version = "0.20.1", features = ["bevy_solari"] }
 
 [[example]]
 name = "room"
 path = "examples/room.rs"
+
+[[example]]
+name = "cornell"
+path = "examples/cornell.rs"
 
 # Shader iteration is the slow part, not rustc: keep deps optimized so the
 # example runs at a sane frame rate in dev builds.

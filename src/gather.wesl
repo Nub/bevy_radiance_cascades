@@ -4,11 +4,11 @@
 
 import package::common::{
     params, view, voxels, depth_tex, gbuffer_tex, cascade_in, output, trace_voxels,
-    history, ambient_occlusion, recent_history, recent_out,
+    history, ambient_occlusion, recent_history, recent_out, emitters, PI,
     irradiance_history, irradiance_out, motion_vectors, ndc_to_pixel, view_size_f,
     oct_dir, view_size_u, linear_depth, pixel_footprint, world_position,
-    gbuffer_valid, gbuffer_normal, surface_normal, gbuffer_reflectance, probe_weights, probe_index, MAX_RADIANCE,
-    DEBUG_IRRADIANCE, DEBUG_SURFACES, DEBUG_WORLD_CACHE,
+    gbuffer_valid, gbuffer_normal, surface_normal, gbuffer_diffuse_color, gbuffer_f0, gbuffer_roughness, gbuffer_specular_color, specular_share, specular_in, specular_out, specular_history, highlight_out, linear_sampler, oct_texel, probe_weights, probe_index, probe_pixel, MAX_RADIANCE,
+    DEBUG_IRRADIANCE, DEBUG_SURFACES, DEBUG_WORLD_CACHE, DEBUG_REFLECTANCE, DEBUG_MATERIALS,
 };
 
 /// Per axis, per direction texel.
@@ -55,7 +55,47 @@ fn incoming(pix: vec2<i32>, g: vec4<u32>, depth: f32) -> vec3<f32> {
         }
     }
     let light = sum / max(cosine_sum, 1e-6) * params.intensity;
-    return clamp(light, vec3<f32>(0.0), vec3<f32>(MAX_RADIANCE));
+    // And the uniform fill (`RadianceCascades::ambient`), as what a white
+    // surface would send on of it: it bounces from here on like the rest.
+    let ambient = vec3<f32>(params.ambient * view.exposure / PI) * params.intensity;
+    return clamp(light + fill_light(position, normal) + ambient, vec3<f32>(0.0), vec3<f32>(MAX_RADIANCE));
+}
+
+/// The light of the emitters that nothing shadows (`RadianceEmitter::clearance`
+/// as much as its range): on every surface in their box that faces them, as an
+/// unshadowed lamp's. As the rest of what `incoming` returns, the radiance a
+/// white surface would send on: the light arriving, over pi.
+fn fill_light(position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var light = vec3<f32>(0.0);
+    for (var i = 0u; i < emitters.count; i++) {
+        let emitter = emitters.items[i];
+        if emitter.clearance < emitter.range {
+            continue;
+        }
+        // (In its box, measured as the cascades do: see `emitted`.)
+        let lifted = position + normal * 0.5;
+        let outside = max(emitter.bounds_min - lifted, lifted - emitter.bounds_max);
+        let out = max(outside.x, max(outside.y, outside.z));
+        if out >= 0.1 {
+            continue;
+        }
+        let to = emitter.position - position;
+        let distance = length(to);
+        if distance >= emitter.range || distance < 1e-4 {
+            continue;
+        }
+        let towards = to / distance;
+        var facing = 1.0;
+        if any(emitter.normal != vec3<f32>(0.0)) {
+            facing = max(dot(emitter.normal, -towards), 0.0);
+        }
+        let cosine = max(dot(normal, towards), 0.0);
+        let angle = emitter.area * facing / (distance * distance + emitter.area);
+        var fade = 1.0 - smoothstep(0.75 * emitter.range, emitter.range, distance);
+        fade *= 1.0 - smoothstep(0.0, 0.1, out);
+        light += emitter.radiance * (view.exposure * angle * cosine * fade / PI);
+    }
+    return light * params.intensity;
 }
 
 fn luminance(color: vec3<f32>) -> f32 {
@@ -68,6 +108,77 @@ struct Accumulated {
     light: vec3<f32>,
     frames: f32,
     recent: vec3<f32>,
+    /// What the place mirrored last frame, and whether that is known.
+    mirrored: vec3<f32>,
+    known: bool,
+    /// The share this frame has in what is accumulated.
+    share: f32,
+}
+
+/// The least share a frame has in what a surface mirrors (see `resolve`).
+const SPECULAR_BLEND: f32 = 0.25;
+
+/// How many times the light arriving at a surface from all round what it
+/// mirrors of the cascades may be (see `resolve`).
+const MIRROR_GAIN: f32 = 1.5;
+
+/// The highlights of the emitters on a surface: each as a small round light
+/// of its size, its light arriving from where it is. Not shadowed (what the
+/// cascades know of what stands between is too coarse for a highlight), but
+/// only in its box and on what faces it; and not the fill lights, which stand
+/// for light that has no one place to be mirrored from.
+fn highlights(g: vec4<u32>, position: vec3<f32>, normal: vec3<f32>, to_eye: vec3<f32>, perceptual_roughness: f32) -> vec3<f32> {
+    if params.specular <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let f0 = gbuffer_f0(g);
+    let roughness = max(perceptual_roughness * perceptual_roughness, 0.03);
+    let n_dot_v = max(dot(normal, to_eye), 1e-3);
+    var sum = vec3<f32>(0.0);
+    for (var i = 0u; i < emitters.count; i++) {
+        let emitter = emitters.items[i];
+        if emitter.clearance >= emitter.range {
+            continue;
+        }
+        let lifted = position + normal * 0.5;
+        let outside = max(emitter.bounds_min - lifted, lifted - emitter.bounds_max);
+        if max(outside.x, max(outside.y, outside.z)) >= 0.1 {
+            continue;
+        }
+        let to = emitter.position - position;
+        let distance = length(to);
+        if distance >= emitter.range || distance < 1e-3 {
+            continue;
+        }
+        let towards = to / distance;
+        var facing = 1.0;
+        if any(emitter.normal != vec3<f32>(0.0)) {
+            facing = max(dot(emitter.normal, -towards), 0.0);
+        }
+        let n_dot_l = dot(normal, towards);
+        if facing <= 0.0 || n_dot_l <= 0.0 {
+            continue;
+        }
+        // A light of some size reflects as a wider highlight than a point's,
+        // of the same light in all (Karis: the roughness widened by the angle
+        // it fills, and the highlight dimmed as much).
+        let radius = sqrt(emitter.area * facing / PI);
+        let wide = saturate(roughness + radius / (2.0 * distance));
+        let spread = roughness / wide;
+        let half_way = normalize(towards + to_eye);
+        let n_dot_h = saturate(dot(normal, half_way));
+        let v_dot_h = saturate(dot(to_eye, half_way));
+        let a2 = wide * wide;
+        let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+        let distribution = a2 / (PI * d * d) * spread * spread;
+        let k = wide * 0.5;
+        let visible = 0.25 / ((n_dot_v * (1.0 - k) + k) * (n_dot_l * (1.0 - k) + k));
+        let fresnel = f0 + (1.0 - f0) * pow(1.0 - v_dot_h, 5.0);
+        let arriving = emitter.area * facing / (distance * distance + emitter.area);
+        let fade = 1.0 - smoothstep(0.75 * emitter.range, emitter.range, distance);
+        sum += emitter.radiance * fresnel * (view.exposure * arriving * n_dot_l * distribution * visible * fade);
+    }
+    return min(sum * params.specular * params.intensity, vec3<f32>(MAX_RADIANCE));
 }
 
 /// The share of a frame in the light of the last few frames.
@@ -106,7 +217,7 @@ const FIREFLY_FRAMES: f32 = 4.0;
 /// of flicker nor slow to lose it.
 fn accumulate(traced: vec3<f32>, deviation: vec3<f32>, pix: vec2<i32>, depth: f32) -> Accumulated {
     var light = traced;
-    let fresh = Accumulated(light, 1.0, light);
+    let fresh = Accumulated(light, 1.0, light, vec3<f32>(0.0), false, 1.0);
     if params.temporal_blend >= 1.0 {
         return fresh;
     }
@@ -131,6 +242,7 @@ fn accumulate(traced: vec3<f32>, deviation: vec3<f32>, pix: vec2<i32>, depth: f3
 
     var sum = vec3<f32>(0.0);
     var sum_recent = vec3<f32>(0.0);
+    var sum_mirrored = vec3<f32>(0.0);
     var frames = 0.0;
     var weight = 0.0;
     for (var j = 0; j < 4; j++) {
@@ -147,6 +259,7 @@ fn accumulate(traced: vec3<f32>, deviation: vec3<f32>, pix: vec2<i32>, depth: f3
         let w = select(1.0 - f.x, f.x, off.x == 1) * select(1.0 - f.y, f.y, off.y == 1);
         sum += old.rgb * w;
         sum_recent += textureLoad(recent_history, p, 0).rgb * w;
+        sum_mirrored += textureLoad(specular_history, p, 0).rgb * w;
         frames += textureLoad(history, p, 0).a * w;
         weight += w;
     }
@@ -165,7 +278,7 @@ fn accumulate(traced: vec3<f32>, deviation: vec3<f32>, pix: vec2<i32>, depth: f3
     let recent = mix(old_recent, light, max(share, RECENT_BLEND));
     let range = deviation * HISTORY_DEVIATIONS + recent * HISTORY_SLACK;
     let old = clamp(old_long, max(recent - range, vec3<f32>(0.0)), recent + range);
-    return Accumulated(mix(old, light, share), count, recent);
+    return Accumulated(mix(old, light, share), count, recent, sum_mirrored / weight * voxels.history_scale, true, share);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -184,6 +297,63 @@ fn gather(@builtin(global_invocation_id) id: vec3<u32>) {
     // As traced, for `resolve` to steady: the light, and the distance of the
     // surface it arrives at.
     textureStore(output, pix, vec4<f32>(incoming(pix, g, depth), linear_depth(depth)));
+}
+
+/// The cascades' light from around the direction a surface mirrors to the
+/// eye: read from `specular_in`, a cascade above the first, whose directions
+/// are finer (and which lacks only what is nearest the surface).
+fn reflected(pix: vec2<i32>, position: vec3<f32>, normal: vec3<f32>, to_eye: vec3<f32>, distance: f32, roughness: f32) -> vec3<f32> {
+    var dir = reflect(-to_eye, normal);
+    // (Kept off the surface: a direction into it sees nothing.)
+    dir = normalize(dir + normal * max(0.05 - dot(dir, normal), 0.0));
+    let spacing = params.probe_spacing << params.spec_level;
+    let res = params.dir_res << params.spec_level;
+    // From the probes around the pixel, three a side and weighed smoothly (a
+    // quadratic B-spline): each probe has one ray a direction, which a lamp or
+    // a lit edge is in for one probe and not for the next, and blended
+    // linearly between the nearest four that difference showed as creases
+    // along the probes' grid, which crawled as the view moved.
+    let s = f32(spacing);
+    let g = (vec2<f32>(pix) + 0.5 - 0.5 - f32(spacing / 2u)) / s;
+    let nearest = floor(g + 0.5);
+    let f = g - nearest;
+    let wx = vec3<f32>(0.5 * (0.5 - f.x) * (0.5 - f.x), 0.75 - f.x * f.x, 0.5 * (0.5 + f.x) * (0.5 + f.x));
+    let wy = vec3<f32>(0.5 * (0.5 - f.y) * (0.5 - f.y), 0.75 - f.y * f.y, 0.5 * (0.5 + f.y) * (0.5 + f.y));
+    let tolerance = pixel_footprint(distance) * s;
+    // And from around the mirrored direction, the wider the rougher the
+    // surface (which is what it mirrors, and evens out the one ray too).
+    let around = clamp(roughness * 2.0, 0.5, 1.5);
+    let texel = oct_texel(dir, res);
+    let low = vec2<f32>(0.5);
+    let high = vec2<f32>(f32(res) - 0.5);
+    // (Its alpha is how much of it the probes know: directions into the
+    // surface a probe stands on are empty there.)
+    var sum = vec4<f32>(0.0);
+    for (var j = 0; j < 9; j++) {
+        let off = vec2<i32>(j % 3, j / 3);
+        let probe = clamp(vec2<i32>(nearest) + off - 1, vec2<i32>(0), vec2<i32>(params.spec_probe_count) - 1);
+        let at = probe_pixel(probe, spacing);
+        let d = textureLoad(depth_tex, at, 0);
+        var similarity = 0.0;
+        if d > 0.0 {
+            let off_plane = dot(normal, world_position(vec2<f32>(at) + 0.5, d) - position) / tolerance;
+            similarity = exp(-off_plane * off_plane);
+        }
+        let w = wx[off.x] * wy[off.y] * max(similarity, 0.02);
+        // (Within the probe's own map: its neighbours' lie right beside it.)
+        let corner = vec2<f32>(probe * i32(res));
+        var seen = vec4<f32>(0.0);
+        for (var k = 0; k < 4; k++) {
+            let side = vec2<f32>(f32(k & 1), f32(k >> 1)) * 2.0 - 1.0;
+            let uv = (corner + clamp(texel + side * around, low, high)) / vec2<f32>(params.spec_texture_size);
+            seen += textureSampleLevel(specular_in, linear_sampler, uv, 0.0);
+        }
+        sum += seen * (0.25 * w);
+    }
+    if sum.a < 1e-6 {
+        return vec3<f32>(0.0);
+    }
+    return sum.rgb / sum.a * params.intensity;
 }
 
 /// Taps to each side of a pixel that `resolve` filters over.
@@ -207,6 +377,8 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(output, pix, vec4<f32>(0.0));
         textureStore(irradiance_out, pix, vec4<f32>(0.0));
         textureStore(recent_out, pix, vec4<f32>(0.0));
+        textureStore(specular_out, pix, vec4<f32>(0.0));
+        textureStore(highlight_out, pix, vec4<f32>(0.0));
         return;
     }
     let depth = textureLoad(depth_tex, pix, 0);
@@ -261,8 +433,51 @@ fn resolve(@builtin(global_invocation_id) id: vec3<u32>) {
     let light = accumulated.light;
     textureStore(irradiance_out, pix, vec4<f32>(light, center.a));
     textureStore(recent_out, pix, vec4<f32>(accumulated.recent, 1.0));
+    // What the surface mirrors. A rough one mirrors about all that arrives
+    // at it; a glossy one what comes from around the mirrored direction,
+    // which is what tells a floor under a dark ceiling from one under a lit
+    // wall.
     let to_eye = normalize(view.world_position - position);
-    textureStore(output, pix, vec4<f32>(light * gbuffer_reflectance(g, normal, to_eye), accumulated.frames));
+    let roughness = gbuffer_roughness(g);
+    let tint = gbuffer_specular_color(g, normal, to_eye);
+    var mirrored = light;
+    let glossy = 1.0 - smoothstep(0.35, 0.75, roughness);
+    if params.specular > 0.0 && glossy > 0.0 {
+        // (No more than a few times what arrives at it from all round: a
+        // small bright lamp is in one direction of one probe's map, and what
+        // mirrors that direction took all of it, a blot of light that came and
+        // went as the view moved. The lamps' highlights are drawn from the
+        // lamps themselves, below.)
+        var seen = reflected(pix, position, normal, to_eye, center.a, roughness) * open;
+        seen *= min(1.0, (luminance(light) * MIRROR_GAIN + 1e-4) / max(luminance(seen), 1e-6));
+        mirrored = mix(light, seen, glossy);
+    }
+    // Steadied in time like the rest, at the same place in the world: read
+    // straight from the cascades, it is as coarse as their probes, and from
+    // one frame to the next of a moving view it is other probes' light, in
+    // stripes that follow their grid. (A short memory: what is mirrored
+    // changes with the view, and with as long a one as the rest has it
+    // trailed behind a turn of the camera, further off than the stripes were.)
+    var specular = mirrored * tint;
+    if accumulated.known {
+        specular = mix(accumulated.mirrored, specular, max(accumulated.share, SPECULAR_BLEND));
+    }
+    textureStore(specular_out, pix, vec4<f32>(specular, 1.0));
+    // The lamps' highlights, straight into the image: they are the lamps'
+    // own light, not something mirrored for a reflection pass to weigh
+    // against what its rays find (which left them out whenever a ray hit
+    // anything, and so whenever the view moved). Not in the debug views that
+    // are not the lighting.
+    var shine = vec3<f32>(0.0);
+    if params.debug <= 1u {
+        shine = highlights(g, position, normal, to_eye, roughness) * open;
+    }
+    textureStore(highlight_out, pix, vec4<f32>(shine, 1.0));
+    var shown = light * gbuffer_diffuse_color(g);
+    if params.specular_separate == 0u {
+        shown += specular * specular_share(roughness);
+    }
+    textureStore(output, pix, vec4<f32>(shown, accumulated.frames));
 }
 
 /// Draws the debug view that replaces the image. Same bindings as `gather`,
@@ -292,6 +507,20 @@ fn debug_view(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     } else if params.debug == DEBUG_IRRADIANCE {
         color = textureLoad(irradiance_history, pix, 0).rgb;
+    } else if params.debug == DEBUG_REFLECTANCE {
+        // How much of the light arriving at each surface it sends on to the
+        // eye, its diffuse and its specular side together.
+        if depth > 0.0 && gbuffer_valid(g) {
+            let position = world_position(vec2<f32>(pix) + 0.5, depth);
+            let to_eye = normalize(view.world_position - position);
+            color = gbuffer_diffuse_color(g) + gbuffer_specular_color(g, gbuffer_normal(g), to_eye);
+        }
+    } else if params.debug == DEBUG_MATERIALS {
+        // Red its roughness, green how metallic, blue its baked occlusion.
+        if depth > 0.0 && gbuffer_valid(g) {
+            let props = unpack4x8unorm(g.b);
+            color = vec3<f32>(gbuffer_roughness(g), props.g, props.b);
+        }
     }
     textureStore(output, pix, vec4<f32>(color, 1.0));
 }
