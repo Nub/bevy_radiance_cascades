@@ -2,3 +2,5 @@
 Cargo.lock
 *.png
 /shots
+__pycache__/
+*.npy
