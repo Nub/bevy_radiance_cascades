@@ -86,6 +86,7 @@ pub struct VoxelUniform {
     history_scale: f32,
     options: u32,
     has_motion_vectors: u32,
+    feedback_scale: f32,
 }
 
 /// The world cache's textures and where each of its levels currently sits.
@@ -790,6 +791,15 @@ fn write_voxel_uniform(
         },
         options,
         has_motion_vectors: motion_vectors as u32,
+        feedback_scale: if settings.intensity > 1e-6 {
+            (if voxels.exposure > 0.0 {
+                exposure / voxels.exposure
+            } else {
+                1.0
+            }) / settings.intensity
+        } else {
+            0.0
+        },
     };
     voxels.exposure = exposure;
     let mut buffer = encase::UniformBuffer::new(Vec::new());

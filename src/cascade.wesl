@@ -74,7 +74,7 @@ fn bounced_radiance(pix: vec2<i32>, depth: f32) -> vec3<f32> {
     if params.specular_separate != 0u {
         left += textureSampleLevel(specular_history, linear_sampler, uv, 0.0).rgb;
     }
-    return params.bounce * voxels.history_scale * left;
+    return params.bounce * voxels.feedback_scale * left;
 }
 
 /// What the ray finds at the pixel where it meets the depth buffer.

@@ -156,7 +156,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
             color = filtered.rgb / filtered.a;
         }
         // Plus the indirect light it had last frame.
-        color += voxels.history_scale * textureLoad(history, pix, 0).rgb;
+        color += voxels.feedback_scale * textureLoad(history, pix, 0).rgb;
         let to_stored = VOXEL_RADIANCE_SCALE / max(view.exposure, 1e-12);
         var observed = clamp(color * to_stored, vec3<f32>(0.0), vec3<f32>(MAX_VOXEL_RADIANCE));
         if info != 0u && (voxels.options & VOXEL_CLAMP_OUTLIERS) != 0u {

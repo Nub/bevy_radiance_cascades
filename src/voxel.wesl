@@ -36,6 +36,11 @@ struct VoxelParams {
     options: u32,
     /// Whether the camera has a motion vector prepass.
     has_motion_vectors: u32,
+    /// `history_scale` over `RadianceCascades::intensity`: the history is the
+    /// light as shown, and what bounces on is the light as it is. Fed back as
+    /// shown, an intensity over 1 was a gain round the loop, and at 4 a white
+    /// wall beside a glowing sign ran away to white.
+    feedback_scale: f32,
 }
 
 const VOXEL_SKIP_MOVING: u32 = 1u;

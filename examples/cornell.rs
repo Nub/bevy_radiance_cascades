@@ -252,7 +252,10 @@ fn setup(
         Some("floor") => {
             Transform::from_xyz(0.9, 2.6, 1.6).looking_at(Vec3::new(-0.4, 0.0, -0.2), Vec3::Y)
         }
-        _ => Transform::from_xyz(0.0, 2.0, 7.3).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
+        // (`RC_EYE`: from how high. From 2 m the top of the tall box is never
+        // seen, and what it sends up to the ceiling is not known.)
+        _ => Transform::from_xyz(0.0, env_or("RC_EYE", 2.0), 7.3)
+            .looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
     };
     let mut camera = commands.spawn((
         Camera3d::default(),
@@ -357,7 +360,14 @@ fn capture(
     mut cameras: Query<&mut Transform, With<Camera3d>>,
 ) {
     shot.frame += 1;
-    if shot.frame == 120 && mode() != "reference" {
+    // (Glided to over a hundred frames, as a player would get there, unless
+    // `RC_JUMP` is set: what the cascades remember has to survive either.)
+    let glide = if std::env::var_os("RC_JUMP").is_some() {
+        1
+    } else {
+        100
+    };
+    if (120..120 + glide).contains(&shot.frame) && mode() != "reference" {
         let view = match std::env::var("RC_VIEW").as_deref() {
             Ok("up") => Some(look_up()),
             Ok("inside") => Some(
@@ -369,8 +379,10 @@ fn capture(
             _ => None,
         };
         if let Some(view) = view {
+            let left = (120 + glide - shot.frame) as f32;
             for mut transform in &mut cameras {
-                *transform = view;
+                transform.translation = transform.translation.lerp(view.translation, 1.0 / left);
+                transform.rotation = transform.rotation.slerp(view.rotation, 1.0 / left);
             }
         }
     }
