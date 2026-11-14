@@ -13,16 +13,18 @@ leave the screen.
 Five rooms of `h4ck`, a Bevy game this was written for and is tested in. Each
 is lit by a few lamps and many small glowing strips, panels and pools. Left:
 the game's rasterized lighting with a flat fill light standing in for bounced
-light. Right: the same view with the fill replaced by radiance cascades
-(screen space and world cache, DLAA at 1080p).
+light. Middle: the same view with the fill replaced by radiance cascades
+(screen space and world cache, DLAA at 1080p). Third column: the same view
+with the game's ray-traced lighting, Bevy Solari denoised by DLSS Ray
+Reconstruction, which replaces the lamps' direct light as well as the bounce.
 
-| Off | On |
-| --- | --- |
-| ![Pump room, cascades off](docs/coolant_off.jpg) | ![Pump room, cascades on](docs/coolant_on.jpg) |
-| ![Cooling columns, cascades off](docs/cascade_off.jpg) | ![Cooling columns, cascades on](docs/cascade_on.jpg) |
-| ![Antenna hall, cascades off](docs/uplink_off.jpg) | ![Antenna hall, cascades on](docs/uplink_on.jpg) |
-| ![Lift shaft, cascades off](docs/shaft_off.jpg) | ![Lift shaft, cascades on](docs/shaft_on.jpg) |
-| ![Vault, cascades off](docs/vault_off.jpg) | ![Vault, cascades on](docs/vault_on.jpg) |
+| Off | On | Ray traced |
+| --- | --- | --- |
+| ![Pump room, cascades off](docs/coolant_off.jpg) | ![Pump room, cascades on](docs/coolant_on.jpg) | ![The same view, ray traced](docs/coolant_rt.jpg) |
+| ![Cooling columns, cascades off](docs/cascade_off.jpg) | ![Cooling columns, cascades on](docs/cascade_on.jpg) | ![The same view, ray traced](docs/cascade_rt.jpg) |
+| ![Antenna hall, cascades off](docs/uplink_off.jpg) | ![Antenna hall, cascades on](docs/uplink_on.jpg) | ![The same view, ray traced](docs/uplink_rt.jpg) |
+| ![Lift shaft, cascades off](docs/shaft_off.jpg) | ![Lift shaft, cascades on](docs/shaft_on.jpg) | ![The same view, ray traced](docs/shaft_rt.jpg) |
+| ![Vault, cascades off](docs/vault_off.jpg) | ![Vault, cascades on](docs/vault_on.jpg) | ![The same view, ray traced](docs/vault_rt.jpg) |
 
 In the pump room the lit coolant pool is what lights the floor, the pipes and
 the ceiling over it, and the pipe in the foreground, which no lamp reaches, is
@@ -33,7 +35,8 @@ these glows is a light source as far as the engine knows: they are emissive
 materials, and the cascades are what makes them cast light.
 
 Where little light reaches, the result is darker than a flat fill, which lights
-everything alike. (The machines in the pairs moved between the two captures.)
+everything alike. (The machines moved between the captures, and the
+vault's shaft of light through the haze does not show in the ray-traced one.)
 
 ```rust
 use bevy::prelude::*;
