@@ -10,25 +10,30 @@ leave the screen.
 
 ## In a game
 
-Two rooms of `h4ck`, a Bevy game this was written for and is tested in. Both
-are lit by a few lamps and many small glowing strips and panels. Left: the
-game's rasterized lighting with a flat fill light standing in for bounced
-light. Right: the same frame with the fill replaced by radiance cascades
-(screen space and world cache, default settings, DLSS quality at 1080p).
+Five rooms of `h4ck`, a Bevy game this was written for and is tested in. Each
+is lit by a few lamps and many small glowing strips, panels and pools. Left:
+the game's rasterized lighting with a flat fill light standing in for bounced
+light. Right: the same view with the fill replaced by radiance cascades
+(screen space and world cache, DLAA at 1080p).
 
 | Off | On |
 | --- | --- |
-| ![Room A, cascades off](docs/room_a_off.jpg) | ![Room A, cascades on](docs/room_a_on.jpg) |
-| ![Room B, cascades off](docs/room_b_off.jpg) | ![Room B, cascades on](docs/room_b_on.jpg) |
+| ![Pump room, cascades off](docs/coolant_off.jpg) | ![Pump room, cascades on](docs/coolant_on.jpg) |
+| ![Cooling columns, cascades off](docs/cascade_off.jpg) | ![Cooling columns, cascades on](docs/cascade_on.jpg) |
+| ![Antenna hall, cascades off](docs/uplink_off.jpg) | ![Antenna hall, cascades on](docs/uplink_on.jpg) |
+| ![Lift shaft, cascades off](docs/shaft_off.jpg) | ![Lift shaft, cascades on](docs/shaft_on.jpg) |
+| ![Vault, cascades off](docs/vault_off.jpg) | ![Vault, cascades on](docs/vault_on.jpg) |
 
-In room A the glowing ring under the machine lights the floor around it and
-the cyan strips light the cabinets beside them. In room B the lamp's light
-bounces off the cabinets and the floor into the parts of the room it does not
-reach. None of these glows is a light source as far as the engine knows: they
-are emissive materials, and the cascades are what makes them cast light.
+In the pump room the lit coolant pool is what lights the floor, the pipes and
+the ceiling over it, and the pipe in the foreground, which no lamp reaches, is
+dark on the side turned away from the pool. In the room of cooling columns the
+pink screens of the two machines tint the floor beside them. In the vault the
+shaft of lamp light bounces off the crates into the floor around them. None of
+these glows is a light source as far as the engine knows: they are emissive
+materials, and the cascades are what makes them cast light.
 
 Where little light reaches, the result is darker than a flat fill, which lights
-everything alike.
+everything alike. (The machines in the pairs moved between the two captures.)
 
 ```rust
 use bevy::prelude::*;
@@ -175,3 +180,7 @@ reports its own GPU time (`rc_pyramids`, `rc_voxels`, `rc_cascade_NN`,
   its luminance and area.
 * Work in progress: stability under camera motion and the cost of the gather
   are being worked on.
+
+## License
+
+MIT or Apache 2.0, at your option. See `LICENSE-MIT` and `LICENSE-APACHE`.
