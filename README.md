@@ -14,7 +14,10 @@ Five rooms of `h4ck`, a Bevy game this was written for and is tested in. Each
 is lit by a few lamps and many small glowing strips, panels and pools. Left:
 the game's rasterized lighting with a flat fill light standing in for bounced
 light. Middle: the same view with the fill replaced by radiance cascades
-(screen space and world cache, DLAA at 1080p). Third column: the same view
+(screen space and world cache, DLAA at 1080p), after the camera has looked
+all the way round from where it stands, as a player would have: placed there
+and never turned, it knows nothing of the room behind it, and those pipes are
+black. Third column: the same view
 ray traced, by Bevy Solari denoised by DLSS Ray Reconstruction, which carries
 the lamps' direct light as well as the bounce. It is given the same lamps and
 glows as the cascades and a uniform fill, set by eye so the rooms come out
@@ -30,8 +33,8 @@ a measured reference (for that see the `cornell` example below).
 | ![Vault, cascades off](docs/vault_off.jpg) | ![Vault, cascades on](docs/vault_on.jpg) | ![The same view, ray traced](docs/vault_rt.jpg) |
 
 In the pump room the lit coolant pool is what lights the floor, the pipes and
-the ceiling over it, and the pipe in the foreground, which no lamp reaches, is
-dark on the side turned away from the pool. In the room of cooling columns the
+the ceiling over it; the side of the foreground pipes turned to the camera is
+lit by the room behind the camera, which only the world cache knows. In the room of cooling columns the
 pink screens of the two machines tint the floor beside them. In the vault the
 shaft of lamp light bounces off the crates into the floor around them. None of
 these glows is a light source as far as the engine knows: they are emissive
