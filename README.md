@@ -34,6 +34,12 @@ shaft of lamp light bounces off the crates into the floor around them. None of
 these glows is a light source as far as the engine knows: they are emissive
 materials, and the cascades are what makes them cast light.
 
+The lamps are shadow mapped in both columns, but they hang straight overhead,
+so their shadows fall under what they light. The shadows the columns and
+crates throw across the floor in the middle column are the cascades': glow
+light that something stands in the way of. The flat fill and the stand-in
+point lights of the left column cast none.
+
 Where little light reaches, the result is darker than a flat fill, which lights
 everything alike. (The machines moved between the captures, and the
 vault's shaft of light through the haze does not show in the ray-traced one.)
