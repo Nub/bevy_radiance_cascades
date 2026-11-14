@@ -15,8 +15,11 @@ is lit by a few lamps and many small glowing strips, panels and pools. Left:
 the game's rasterized lighting with a flat fill light standing in for bounced
 light. Middle: the same view with the fill replaced by radiance cascades
 (screen space and world cache, DLAA at 1080p). Third column: the same view
-with the game's ray-traced lighting, Bevy Solari denoised by DLSS Ray
-Reconstruction, which replaces the lamps' direct light as well as the bounce.
+ray traced, by Bevy Solari denoised by DLSS Ray Reconstruction, which carries
+the lamps' direct light as well as the bounce. It is given the same lamps and
+glows as the cascades and a uniform fill, set by eye so the rooms come out
+about as bright: it is a second rendering to look at beside the cascades, not
+a measured reference (for that see the `cornell` example below).
 
 | Off | On | Ray traced |
 | --- | --- | --- |
