@@ -663,7 +663,7 @@ pub fn radiance_cascades(
 
     // The world cache before the cascades, so their rays already find this
     // frame in it. (It reads the color pyramid.)
-    if voxels.levels > 0 {
+    if voxels.levels > 0 && !voxels.held {
         let span = diagnostics.time_span(command_encoder, "rc_voxels");
         command_encoder.clear_buffer(&voxels.marks, 0, None);
         let mut pass = compute_pass(command_encoder, "radiance_cascades_voxels");
@@ -675,13 +675,16 @@ pub fn radiance_cascades(
         let groups = voxels.resolution.div_ceil(4);
         pass.set_pipeline(voxel_update_pipeline);
         pass.dispatch_workgroups(groups, groups, groups);
-        // And what that leaves of the level's blocks of voxels.
-        let fine_groups = (voxels.resolution / 4).div_ceil(4);
-        pass.set_pipeline(voxel_mask_fine_pipeline);
-        pass.dispatch_workgroups(fine_groups, fine_groups, fine_groups);
-        let coarse_groups = (voxels.resolution / 16).div_ceil(4);
-        pass.set_pipeline(voxel_mask_coarse_pipeline);
-        pass.dispatch_workgroups(coarse_groups, coarse_groups, coarse_groups);
+        // And what that leaves of the level's blocks of voxels. (An anchor
+        // has none: no ray crosses it.)
+        if !voxels.updating_anchor {
+            let fine_groups = (voxels.resolution / 4).div_ceil(4);
+            pass.set_pipeline(voxel_mask_fine_pipeline);
+            pass.dispatch_workgroups(fine_groups, fine_groups, fine_groups);
+            let coarse_groups = (voxels.resolution / 16).div_ceil(4);
+            pass.set_pipeline(voxel_mask_coarse_pipeline);
+            pass.dispatch_workgroups(coarse_groups, coarse_groups, coarse_groups);
+        }
         drop(pass);
         span.end(command_encoder);
     }

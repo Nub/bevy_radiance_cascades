@@ -180,6 +180,13 @@ reports its own GPU time (`rc_pyramids`, `rc_voxels`, `rc_cascade_NN`,
 * **The world cache only knows what has been on screen.** Light sources the
   camera has never looked at contribute nothing until it does, and what it
   remembers of places it no longer sees is as they were when last seen.
+  `WorldCache::anchors` soften this: up to four volumes that stand still in
+  the world and keep, coarsely (`anchor_voxel_size`), what has been seen in
+  them. A voxel that comes into range unseen starts from what an anchor
+  remembers of the place. To fill them before play, take the camera round
+  the world behind a loading screen, each view shown one frame with `hold`
+  set and one with `prime` (and `temporal_blend` 1 meanwhile). Anything that
+  rebuilds the cascades' textures (a change of render size) empties them.
 * Voxels of the world cache are 12.5 cm by default: thinner walls can leak
   remembered light.
 * Perspective projections only, and the camera's viewport must start at the

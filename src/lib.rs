@@ -317,7 +317,39 @@ pub struct WorldCache {
     /// Experimental. Voxels seen nearly edge on stop a ray partly, by how
     /// they face it, instead of wholly or not at all on either side of a line.
     pub soft_facing: bool,
+    /// Anchors: the middles of up to [`MAX_ANCHORS`] volumes that stand still
+    /// in the world, each `resolution` voxels of `anchor_voxel_size` a side
+    /// (the first `anchor_count` of these). A level follows the camera and
+    /// forgets what it leaves behind; an anchor remembers what has been seen
+    /// in its volume for good, coarsely. Rays do not read the anchors: a
+    /// voxel of a level that comes into range with nothing showing in it
+    /// takes what an anchor remembers of the place, where no finer level
+    /// does. So a place that was looked at once, from anywhere (on a tour of
+    /// the world behind a loading screen, see `prime`), lights what is near
+    /// it from the first frame the camera stands in it, before it has turned
+    /// to look.
+    ///
+    /// Each anchor costs the memory of a level, and one update in eight goes
+    /// to the anchor nearest the camera in place of the finest level's.
+    pub anchors: [bevy::math::Vec3; MAX_ANCHORS],
+    pub anchor_count: u32,
+    /// Size of the anchors' voxels, in world units.
+    pub anchor_voxel_size: f32,
+    /// Every update goes to the anchor nearest the camera, none to the
+    /// levels: for filling the anchors quickly while the camera is taken
+    /// round the world out of the player's sight. What a voxel takes in is
+    /// the lit scene and the light bounced onto it last frame, so a view the
+    /// camera has jumped to is shown for a frame with `hold` set before one
+    /// with `prime`, and `RadianceCascades::temporal_blend` is 1 for as long
+    /// (or what is taken in is a tenth of the bounced light).
+    pub prime: bool,
+    /// Nothing of the cache is brought up to date this frame; rays read it
+    /// as it is.
+    pub hold: bool,
 }
+
+/// The most anchors a [`WorldCache`] has.
+pub const MAX_ANCHORS: usize = 4;
 
 impl Default for WorldCache {
     fn default() -> Self {
@@ -333,6 +365,11 @@ impl Default for WorldCache {
             coarse_from_fine: false,
             clamp_outliers: false,
             soft_facing: false,
+            anchors: [bevy::math::Vec3::ZERO; MAX_ANCHORS],
+            anchor_count: 0,
+            anchor_voxel_size: 1.0,
+            prime: false,
+            hold: false,
         }
     }
 }

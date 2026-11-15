@@ -18,6 +18,7 @@ import package::voxel::{
     VoxelParams, voxel_texel, pack_voxel_meta, voxel_normal, voxel_confidence, voxel_occupied,
     VOXEL_RADIANCE_SCALE, VOXEL_OCCUPIED, VOXEL_CONFIDENCE_MASK, VOXEL_CONFIDENCE_SHIFT, VOXEL_CONFIDENCE_MAX,
     VOXEL_SKIP_MOVING, VOXEL_COARSE_FROM_FINE, VOXEL_CLAMP_OUTLIERS,
+    VOXEL_OFFSET_MASK, pack_voxel_offset, voxel_offset,
 };
 
 @group(0) @binding(0) var<uniform> voxels: VoxelParams;
@@ -38,6 +39,27 @@ import package::voxel::{
 @group(0) @binding(11) var<storage, read_write> marks: array<atomic<u32>>;
 /// How far each pixel has moved across the view since last frame, in UV.
 @group(0) @binding(12) var motion_vectors: texture_2d<f32>;
+
+/// Whether it is an anchor's turn to be brought up to date, not a level's.
+fn updating_anchor() -> bool {
+    return voxels.update_level >= voxels.levels;
+}
+
+/// The size of the voxels being brought up to date.
+fn update_size() -> f32 {
+    if updating_anchor() {
+        return voxels.anchor_size;
+    }
+    return voxels.voxel_size * f32(1u << voxels.update_level);
+}
+
+/// World index of the minimum corner of what is being brought up to date.
+fn update_origin() -> vec3<i32> {
+    if updating_anchor() {
+        return voxels.anchor_origin[voxels.update_level - voxels.levels].xyz;
+    }
+    return voxels.origin[voxels.update_level].xyz;
+}
 
 /// rgb9e5 tops out here.
 const MAX_VOXEL_RADIANCE: f32 = 65000.0;
@@ -89,10 +111,9 @@ fn mark(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let n = i32(voxels.resolution);
-    let level = voxels.update_level;
-    let size = voxels.voxel_size * f32(1u << level);
+    let size = update_size();
     let index = vec3<i32>(floor(p / size));
-    let rel = index - voxels.origin[level].xyz;
+    let rel = index - update_origin();
     if any(rel < vec3<i32>(0)) || any(rel >= vec3<i32>(n)) {
         return;
     }
@@ -110,7 +131,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let level = voxels.update_level;
     let local = vec3<i32>(id);
-    let origin = voxels.origin[level].xyz;
+    let origin = update_origin();
     let prev_origin = voxels.update_prev_origin.xyz;
     // The voxel this texel stands for now, and stood for at the last update.
     let index = origin + (((local - origin) % n) + n) % n;
@@ -130,17 +151,54 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         // rays ask the finest level that covers a place, so as the camera
         // came nearer a floor it had seen from across the room, the floor was
         // forgotten, and the ceiling it lights went dark.
+        // (Any level above, the finest that knows of it: the one just above
+        // may not have caught up with a camera that jumped. And the anchors,
+        // which stand still and so remember places the levels have scrolled
+        // away from, or were shown before anyone came near: in their turn by
+        // the size of their voxels. An anchor itself starts from empty.)
         var kept_info = 0u;
         var kept_radiance = 0u;
-        if level + 1u < voxels.levels {
-            let above = index >> vec3<u32>(1u);
-            let rel = above - voxels.origin[level + 1u].xyz;
-            if all(rel >= vec3<i32>(0)) && all(rel < vec3<i32>(n)) {
-                let source = voxel_texel(above, level + 1u, voxels.resolution);
-                let its = textureLoad(voxel_meta, source).r;
-                if voxel_occupied(its) {
-                    kept_info = its;
-                    kept_radiance = textureLoad(voxel_radiance, source).r;
+        // (An anchor knows the place, and its surface passes this voxel by.)
+        var passed_by = false;
+        if !updating_anchor() {
+            let here = (vec3<f32>(index) + 0.5) * update_size();
+            var anchors_asked = voxels.anchors == 0u;
+            for (var above_level = level + 1u; above_level <= voxels.levels && kept_info == 0u && !passed_by; above_level++) {
+                let above_size = voxels.voxel_size * f32(1u << above_level);
+                if !anchors_asked && (above_level == voxels.levels || voxels.anchor_size <= above_size) {
+                    anchors_asked = true;
+                    for (var a = 0u; a < voxels.anchors && kept_info == 0u; a++) {
+                        let anchor = voxels.anchor_origin[a];
+                        let at = vec3<i32>(floor(here / voxels.anchor_size));
+                        let rel = at - anchor.xyz;
+                        if anchor.w != 0 && all(rel >= vec3<i32>(0)) && all(rel < vec3<i32>(n)) {
+                            let source = voxel_texel(at, voxels.levels + a, voxels.resolution);
+                            let its = textureLoad(voxel_meta, source).r;
+                            if voxel_occupied(its) {
+                                // Where its surface lies, if this voxel is the finer.
+                                let middle = (vec3<f32>(at) + 0.5) * voxels.anchor_size;
+                                let off = dot(voxel_normal(its), here - middle) - voxel_offset(its, voxels.anchor_size);
+                                if update_size() >= voxels.anchor_size || abs(off) <= 0.87 * update_size() + 0.06 * voxels.anchor_size {
+                                    kept_info = its & ~VOXEL_OFFSET_MASK;
+                                    kept_radiance = textureLoad(voxel_radiance, source).r;
+                                } else {
+                                    passed_by = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if above_level < voxels.levels && kept_info == 0u && !passed_by {
+                    let above = index >> vec3<u32>(above_level - level);
+                    let rel = above - voxels.origin[above_level].xyz;
+                    if all(rel >= vec3<i32>(0)) && all(rel < vec3<i32>(n)) {
+                        let source = voxel_texel(above, above_level, voxels.resolution);
+                        let its = textureLoad(voxel_meta, source).r;
+                        if voxel_occupied(its) {
+                            kept_info = its;
+                            kept_radiance = textureLoad(voxel_radiance, source).r;
+                        }
+                    }
                 }
             }
         }
@@ -153,7 +211,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let size = voxels.voxel_size * f32(1u << level);
+    let size = update_size();
     let view_size = view.main_pass_viewport.zw;
     let near = view.clip_from_view[3][2];
     let center = (vec3<f32>(index) + 0.5) * size;
@@ -200,6 +258,9 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         let confidence = min(voxel_confidence(info) + 2u, VOXEL_CONFIDENCE_MAX);
         let enough = select(2u, 4u, level <= 2u);
         info = pack_voxel_meta(normal, confidence, voxel_occupied(info) || confidence >= enough);
+        if updating_anchor() {
+            info |= pack_voxel_offset(dot(normal, world_at(pix, textureLoad(depth_tex, pix, 0)) - center), size);
+        }
     } else {
         // Nothing shows in it. Does the camera see clean through it? Asked at
         // the centres of its eight octants, of all of which it has to be true.
@@ -250,7 +311,7 @@ fn update(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
 
-    if info != 0u && level > 0u && (voxels.options & VOXEL_COARSE_FROM_FINE) != 0u {
+    if info != 0u && level > 0u && !updating_anchor() && (voxels.options & VOXEL_COARSE_FROM_FINE) != 0u {
         // Where the next finer level covers this voxel, its color is the mean
         // of what that level holds in it, so that the two agree on it.
         let finer = level - 1u;

@@ -16,12 +16,21 @@
 import bevy_render::utils::{octahedral_encode, octahedral_decode};
 
 const MAX_VOXEL_LEVELS: u32 = 8u;
+/// Anchors: volumes of `resolution^3` voxels that stand still in the world
+/// (see `WorldCache::anchors`). They are kept after the levels in the
+/// textures, and brought up to date as a level is: `update_level` at or over
+/// `levels` is an anchor's turn. Rays do not read them; a voxel of a level
+/// that scrolls in with nothing showing in it takes what they remember.
+const MAX_VOXEL_ANCHORS: u32 = 4u;
 
 struct VoxelParams {
     /// World index of each level's minimum corner voxel.
     origin: array<vec4<i32>, MAX_VOXEL_LEVELS>,
     /// Where the level being updated was when it was last updated.
     update_prev_origin: vec4<i32>,
+    /// World index, in voxels of `anchor_size`, of each anchor's minimum
+    /// corner; `w` is 0 until the anchor has been brought up to date once.
+    anchor_origin: array<vec4<i32>, MAX_VOXEL_ANCHORS>,
     /// Last frame's (unjittered) view.
     prev_clip_from_world: mat4x4<f32>,
     resolution: u32,
@@ -41,6 +50,9 @@ struct VoxelParams {
     /// shown, an intensity over 1 was a gain round the loop, and at 4 a white
     /// wall beside a glowing sign ran away to white.
     feedback_scale: f32,
+    /// Size of the anchors' voxels, and how many anchors there are.
+    anchor_size: f32,
+    anchors: u32,
 }
 
 const VOXEL_SKIP_MOVING: u32 = 1u;
@@ -83,6 +95,30 @@ const VOXEL_OCCUPIED: u32 = 0x80000000u;
 const VOXEL_CONFIDENCE_SHIFT: u32 = 24u;
 const VOXEL_CONFIDENCE_MASK: u32 = 0x07000000u;
 const VOXEL_CONFIDENCE_MAX: u32 = 7u;
+
+/// An anchor's voxel also keeps where in it the surface lies: how far along
+/// its normal from the voxel's middle, in sixteen steps over the voxel's
+/// diagonal. An anchor's voxels are coarse (a metre and more), and a fine
+/// voxel that takes what one remembers takes it only where that plane passes:
+/// taken throughout, a wall was a metre thick, and everything standing within
+/// a metre of anything was shut up in a block of it, in the dark.
+const VOXEL_OFFSET_SHIFT: u32 = 27u;
+const VOXEL_OFFSET_MASK: u32 = 0x78000000u;
+
+/// The offset's reach either way: half the diagonal of a voxel of `size`.
+fn voxel_offset_reach(size: f32) -> f32 {
+    return 0.866 * size;
+}
+
+fn pack_voxel_offset(offset: f32, size: f32) -> u32 {
+    let unit = saturate(offset / voxel_offset_reach(size) * 0.5 + 0.5);
+    return u32(unit * 15.0 + 0.5) << VOXEL_OFFSET_SHIFT;
+}
+
+fn voxel_offset(info: u32, size: f32) -> f32 {
+    let unit = f32((info & VOXEL_OFFSET_MASK) >> VOXEL_OFFSET_SHIFT) / 15.0;
+    return (unit * 2.0 - 1.0) * voxel_offset_reach(size);
+}
 
 fn voxel_confidence(info: u32) -> u32 {
     return (info & VOXEL_CONFIDENCE_MASK) >> VOXEL_CONFIDENCE_SHIFT;

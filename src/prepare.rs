@@ -1,4 +1,4 @@
-use crate::{MAX_CASCADES, RadianceCascades, RadianceCascadesDebug};
+use crate::{MAX_ANCHORS, MAX_CASCADES, RadianceCascades, RadianceCascadesDebug};
 use bevy::{
     camera::MainPassResolutionOverride,
     core_pipeline::prepass::MotionVectorPrepass,
@@ -76,6 +76,7 @@ const MAX_VOXEL_LEVELS: usize = 8;
 pub struct VoxelUniform {
     origin: [IVec4; MAX_VOXEL_LEVELS],
     update_prev_origin: IVec4,
+    anchor_origin: [IVec4; MAX_ANCHORS],
     prev_clip_from_world: Mat4,
     resolution: u32,
     levels: u32,
@@ -87,6 +88,8 @@ pub struct VoxelUniform {
     options: u32,
     has_motion_vectors: u32,
     feedback_scale: f32,
+    anchor_size: f32,
+    anchors: u32,
 }
 
 /// The world cache's textures and where each of its levels currently sits.
@@ -106,6 +109,19 @@ pub struct VoxelCache {
     voxel_size: f32,
     /// World index of each level's minimum corner, as of its last update.
     origin: [IVec3; MAX_VOXEL_LEVELS],
+    /// How many anchors there are, and the same of each of them, in its own
+    /// voxels (`None` until it has been brought up to date once).
+    pub anchors: u32,
+    anchor_origin: [Option<IVec3>; MAX_ANCHORS],
+    /// This frame's update is an anchor's (which has no occupancy masks).
+    pub updating_anchor: bool,
+    /// Nothing is brought up to date this frame (`WorldCache::hold`).
+    pub held: bool,
+    /// The levels (a bit each) that start over at their next update, every
+    /// voxel of them as if it had just come into range: after the anchors
+    /// were primed, so that what they now know is taken up where the levels
+    /// already stand.
+    refill: u32,
     frame: u32,
     /// The exposure the previous frame was rendered with.
     exposure: f32,
@@ -120,8 +136,8 @@ struct Layout {
     probe_spacing: u32,
     base_resolution: u32,
     cascade_count: u32,
-    /// Resolution, levels and voxel size (as bits) of the world cache.
-    voxels: Option<(u32, u32, u32)>,
+    /// Resolution, levels, voxel size (as bits) and anchors of the world cache.
+    voxels: Option<(u32, u32, u32, u32)>,
 }
 
 impl Layout {
@@ -146,6 +162,7 @@ impl Layout {
                     cache.resolution.clamp(16, 256).next_multiple_of(16),
                     cache.levels.clamp(1, MAX_VOXEL_LEVELS as u32),
                     cache.voxel_size.max(1e-3).to_bits(),
+                    cache.anchor_count.min(MAX_ANCHORS as u32),
                 )
             }),
         };
@@ -613,10 +630,10 @@ fn create_resources(
     textures.push(color_texture);
 
     // Without a world cache the bindings still need something to point at.
-    let (resolution, levels, voxel_size) = layout
+    let (resolution, levels, voxel_size, anchors) = layout
         .voxels
-        .map_or((4, 0, 1.0), |(resolution, levels, size)| {
-            (resolution, levels, f32::from_bits(size))
+        .map_or((4, 0, 1.0, 0), |(resolution, levels, size, anchors)| {
+            (resolution, levels, f32::from_bits(size), anchors)
         });
     let mut create_voxel_texture = |label: &'static str| {
         let texture = render_device.create_texture(&TextureDescriptor {
@@ -624,7 +641,8 @@ fn create_resources(
             size: Extent3d {
                 width: resolution,
                 height: resolution,
-                depth_or_array_layers: resolution * levels.max(1),
+                // (The anchors after the levels.)
+                depth_or_array_layers: resolution * (levels + anchors).max(1),
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -677,6 +695,11 @@ fn create_resources(
         // Nowhere near anything, so that the first update of each level
         // starts it from empty.
         origin: [IVec3::splat(i32::MIN / 2); MAX_VOXEL_LEVELS],
+        anchors,
+        anchor_origin: [None; MAX_ANCHORS],
+        updating_anchor: false,
+        held: false,
+        refill: 0,
         frame: 0,
         exposure: 0.0,
     };
@@ -757,22 +780,64 @@ fn write_voxel_uniform(
     .fold(0u32, |flags, (bit, on)| flags | (*on as u32) << bit);
     // The fine levels are what is near, where the view changes fastest: the
     // first is updated every other frame, the next every fourth, and so on.
-    voxels.frame = voxels.frame.wrapping_add(1);
-    let update_level = voxels
-        .frame
-        .max(1)
-        .trailing_zeros()
-        .min(voxels.levels.max(1) - 1);
-
-    let size = voxels.voxel_size * (1u32 << update_level) as f32;
+    voxels.held = cache.hold;
+    if cache.hold || cache.prime {
+        voxels.refill = !0;
+    }
+    if !voxels.held {
+        voxels.frame = voxels.frame.wrapping_add(1);
+    }
     let camera = view.world_from_view.translation();
-    let prev_origin = voxels.origin[update_level as usize];
-    voxels.origin[update_level as usize] =
-        (camera / size).floor().as_ivec3() - IVec3::splat(voxels.resolution as i32 / 2);
+    let nowhere = IVec3::splat(i32::MIN / 2);
+    let half = IVec3::splat(voxels.resolution as i32 / 2);
+    let anchor_size = cache.anchor_voxel_size.max(1e-3);
+    // An anchor's turn: every frame while the cache is being primed, else
+    // one frame in eight, taken from the finest level's (which has half of
+    // them). The anchor nearest the camera: the one it is most likely in.
+    let anchor = (!voxels.held && voxels.anchors > 0 && (cache.prime || voxels.frame % 8 == 7))
+        .then(|| {
+            (0..voxels.anchors as usize).min_by(|a, b| {
+                cache.anchors[*a]
+                    .distance_squared(camera)
+                    .total_cmp(&cache.anchors[*b].distance_squared(camera))
+            })
+        })
+        .flatten();
+    voxels.updating_anchor = anchor.is_some();
+    let (update_level, prev_origin) = match anchor {
+        Some(anchor) => {
+            // (Where it stands now. Moved, it starts from empty: every voxel
+            // of it is another place than it was.)
+            let origin = (cache.anchors[anchor] / anchor_size).floor().as_ivec3() - half;
+            let prev = voxels.anchor_origin[anchor].replace(origin).unwrap_or(nowhere);
+            (voxels.levels + anchor as u32, prev)
+        }
+        // (Held: no level moves, and the update is not run.)
+        None if voxels.held => (0, voxels.origin[0]),
+        None => {
+            let update_level = voxels
+                .frame
+                .max(1)
+                .trailing_zeros()
+                .min(voxels.levels.max(1) - 1);
+            let size = voxels.voxel_size * (1u32 << update_level) as f32;
+            let prev = if voxels.refill & (1 << update_level) != 0 {
+                voxels.refill &= !(1 << update_level);
+                nowhere
+            } else {
+                voxels.origin[update_level as usize]
+            };
+            voxels.origin[update_level as usize] = (camera / size).floor().as_ivec3() - half;
+            (update_level, prev)
+        }
+    };
 
     let uniform = VoxelUniform {
         origin: voxels.origin.map(|origin| origin.extend(0)),
         update_prev_origin: prev_origin.extend(0),
+        anchor_origin: voxels
+            .anchor_origin
+            .map(|origin| origin.map_or(IVec4::ZERO, |origin| origin.extend(1))),
         prev_clip_from_world,
         resolution: voxels.resolution,
         levels: voxels.levels,
@@ -784,6 +849,8 @@ fn write_voxel_uniform(
         // first. (Up to a point: the coarse ones are looked at so seldom that
         // they would take whatever a single look showed.)
         blend: 1.0 - (1.0 - cache.blend.clamp(0.01, 1.0)).powi(1 << update_level.min(2)),
+        anchor_size,
+        anchors: voxels.anchors,
         history_scale: if voxels.exposure > 0.0 {
             exposure / voxels.exposure
         } else {
